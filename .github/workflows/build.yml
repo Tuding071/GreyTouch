@@ -126,8 +126,8 @@ jobs:
                   applicationId = "com.grey.touch"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = (project.findProperty("BUILD_NUMBER") as String? ?: "1").toInt()
+                  versionName = "1.0.${project.findProperty("BUILD_NUMBER") as String? ?: "1"}"
               }
 
               buildFeatures {
@@ -197,10 +197,10 @@ jobs:
       - name: Build APK
         run: |
           chmod +x gradlew || (gradle wrapper && chmod +x gradlew)
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug -PBUILD_NUMBER=${{ github.run_number }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AssistiveTouch-debug
+          name: AssistiveTouch-debug-${{ github.run_number }}
           path: app/build/outputs/apk/debug/app-debug.apk
