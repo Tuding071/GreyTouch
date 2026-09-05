@@ -1,12 +1,16 @@
 package com.grey.touch
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.graphics.Color
-import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.DisplayMetrics
 import android.view.*
 import android.view.accessibility.AccessibilityEvent
@@ -17,12 +21,14 @@ class AssistiveTouchService : AccessibilityService() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var bubble: FrameLayout
+    private lateinit var glyph: android.widget.ImageView
     private lateinit var params: WindowManager.LayoutParams
     private lateinit var prefs: SharedPreferences
+    private lateinit var vibrator: Vibrator
 
     private var screenWidth = 0
     private var screenHeight = 0
-    private val bubbleSizeDp = 56
+    private var bubbleSizePx = 0
 
     // gesture tracking
     private var downRawX = 0f
@@ -32,36 +38,59 @@ class AssistiveTouchService : AccessibilityService() {
     private var downTime = 0L
     private var isDragging = false
     private var longPressTriggered = false
+    private var moved = false
+
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private val longPressRunnable = Runnable {
         longPressTriggered = true
         isDragging = true
+        vibrate()
     }
-    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    companion object {
+        const val TAP_MAX_MS = 200L
+        const val HOLD_MIN_MS = 300L
+        const val MOVE_THRESHOLD_PX = 20
+        const val SWIPE_THRESHOLD_PX = 60
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         prefs = getSharedPreferences("assistive_touch_prefs", Context.MODE_PRIVATE)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+            vm.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        }
 
-        val metrics = DisplayMetrics()
-        windowManager.defaultDisplay.getMetrics(metrics)
-        screenWidth = metrics.widthPixels
-        screenHeight = metrics.heightPixels
+        measureScreen()
 
-        val density = metrics.density
-        val bubbleSizePx = (bubbleSizeDp * density).toInt()
+        val density = resources.displayMetrics.density
+        bubbleSizePx = (56 * density).toInt()
 
-        bubble = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(160, 40, 40, 40))
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                cornerRadius = bubbleSizePx / 3.2f
-                setColor(Color.argb(150, 50, 50, 50))
+        glyph = android.widget.ImageView(this).apply {
+            val glyphSize = (24 * density).toInt()
+            layoutParams = FrameLayout.LayoutParams(glyphSize, glyphSize, Gravity.CENTER)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 8 * density
+                setColor(Color.WHITE)
             }
         }
 
-        val defaultX = screenWidth - bubbleSizePx - (8 * density).toInt()
-        val defaultY = (screenHeight / 2) - (bubbleSizePx / 2)
+        bubble = FrameLayout(this).apply {
+            addView(glyph)
+        }
+        applyIdleAppearance()
+
+        val savedRatioX = prefs.getFloat("anchor_edge", 1f) // 0f = left, 1f = right
+        val savedRatioY = prefs.getFloat("ratio_y", 0.5f)
+
+        val startX = if (savedRatioX <= 0f) 0 else screenWidth - bubbleSizePx
+        val startY = ((screenHeight - bubbleSizePx) * savedRatioY).toInt()
 
         params = WindowManager.LayoutParams(
             bubbleSizePx,
@@ -72,12 +101,67 @@ class AssistiveTouchService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = prefs.getInt("bubble_x", defaultX)
-            y = prefs.getInt("bubble_y", defaultY)
+            x = startX
+            y = startY.coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
         }
 
         bubble.setOnTouchListener { _, event -> handleTouch(event) }
         windowManager.addView(bubble, params)
+    }
+
+    private fun measureScreen() {
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getMetrics(metrics)
+        screenWidth = metrics.widthPixels
+        screenHeight = metrics.heightPixels
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (!::windowManager.isInitialized || !::bubble.isInitialized) return
+
+        // re-measure after rotation and re-anchor using saved ratios (not stale pixels)
+        handler.postDelayed({
+            measureScreen()
+            val anchorEdge = prefs.getFloat("anchor_edge", 1f)
+            val ratioY = prefs.getFloat("ratio_y", 0.5f)
+
+            params.x = if (anchorEdge <= 0f) 0 else screenWidth - bubbleSizePx
+            params.y = ((screenHeight - bubbleSizePx) * ratioY).toInt()
+                .coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
+
+            windowManager.updateViewLayout(bubble, params)
+        }, 150L)
+    }
+
+    private fun vibrate() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(VibrationEffect.createOneShot(20, VibrationEffect.DEFAULT_AMPLITUDE))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(20)
+        }
+    }
+
+    private fun applyIdleAppearance() {
+        bubble.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 18 * resources.displayMetrics.density
+            setColor(Color.argb(102, 20, 20, 22)) // ~40% opacity dark
+            setStroke((1 * resources.displayMetrics.density).toInt(), Color.argb(64, 255, 255, 255))
+        }
+        (glyph.background as GradientDrawable).setColor(Color.WHITE)
+    }
+
+    private fun applyTouchedAppearance() {
+        bubble.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 18 * resources.displayMetrics.density
+            setColor(Color.argb(242, 255, 255, 255)) // ~95% opacity white
+            setStroke((1 * resources.displayMetrics.density).toInt(), Color.argb(77, 0, 0, 0))
+        }
+        (glyph.background as GradientDrawable).setColor(Color.BLACK)
     }
 
     private fun handleTouch(event: MotionEvent): Boolean {
@@ -90,49 +174,48 @@ class AssistiveTouchService : AccessibilityService() {
                 downTime = System.currentTimeMillis()
                 isDragging = false
                 longPressTriggered = false
-                handler.postDelayed(longPressRunnable, 500L)
+                moved = false
+                applyTouchedAppearance()
+                handler.postDelayed(longPressRunnable, HOLD_MIN_MS)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
                 val dx = event.rawX - downRawX
                 val dy = event.rawY - downRawY
 
-                if (!longPressTriggered && (abs(dx) > 20 || abs(dy) > 20)) {
-                    // moved before long-press threshold -> treat as swipe, cancel long-press drag
-                    handler.removeCallbacks(longPressRunnable)
+                if (!moved && (abs(dx) > MOVE_THRESHOLD_PX || abs(dy) > MOVE_THRESHOLD_PX)) {
+                    moved = true
+                    if (!longPressTriggered) handler.removeCallbacks(longPressRunnable)
                 }
 
                 if (isDragging) {
-                    params.x = initialX + dx.toInt()
-                    params.y = initialY + dy.toInt()
+                    params.x = (initialX + dx.toInt()).coerceIn(0, screenWidth - bubbleSizePx)
+                    params.y = (initialY + dy.toInt()).coerceIn(0, screenHeight - bubbleSizePx)
                     windowManager.updateViewLayout(bubble, params)
                 }
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(longPressRunnable)
+                applyIdleAppearance()
+
                 val dx = event.rawX - downRawX
                 val dy = event.rawY - downRawY
                 val elapsed = System.currentTimeMillis() - downTime
 
                 if (isDragging) {
-                    // save new position, snap to edge optional (not requested) - keep free position
-                    prefs.edit().putInt("bubble_x", params.x).putInt("bubble_y", params.y).apply()
+                    snapToNearestEdge()
+                } else if (!moved && elapsed < TAP_MAX_MS) {
+                    vibrate()
+                    performGlobalAction(GLOBAL_ACTION_BACK)
                 } else {
-                    val swipeThreshold = 60
+                    val swipedUp = dy < -SWIPE_THRESHOLD_PX && abs(dy) > abs(dx)
+                    val swipedDown = dy > SWIPE_THRESHOLD_PX && abs(dy) > abs(dx)
                     when {
-                        dy < -swipeThreshold && abs(dy) > abs(dx) -> {
-                            // swipe up
-                            performRecents()
-                        }
-                        dy > swipeThreshold && abs(dy) > abs(dx) -> {
-                            // swipe down - placeholder
-                            performMenuPlaceholder()
-                        }
-                        abs(dx) < 20 && abs(dy) < 20 && elapsed < 400 -> {
-                            // tap
-                            performGlobalAction(GLOBAL_ACTION_BACK)
-                        }
+                        swipedUp -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+                        swipedDown -> android.widget.Toast.makeText(
+                            this, "Menu: coming soon", android.widget.Toast.LENGTH_SHORT
+                        ).show()
                     }
                 }
                 isDragging = false
@@ -142,12 +225,40 @@ class AssistiveTouchService : AccessibilityService() {
         return false
     }
 
-    private fun performRecents() {
-        performGlobalAction(GLOBAL_ACTION_RECENTS)
+    private fun snapToNearestEdge() {
+        val centerX = params.x + bubbleSizePx / 2
+        val snapToLeft = centerX < screenWidth / 2
+        val targetX = if (snapToLeft) 0 else screenWidth - bubbleSizePx
+
+        val startX = params.x
+        val distance = targetX - startX
+        val steps = 8
+        var step = 0
+
+        val animator = object : Runnable {
+            override fun run() {
+                step++
+                val progress = step.toFloat() / steps
+                params.x = (startX + distance * progress).toInt()
+                windowManager.updateViewLayout(bubble, params)
+                if (step < steps) {
+                    handler.postDelayed(this, 8L)
+                } else {
+                    params.x = targetX
+                    windowManager.updateViewLayout(bubble, params)
+                    saveAnchor(snapToLeft)
+                }
+            }
+        }
+        handler.post(animator)
     }
 
-    private fun performMenuPlaceholder() {
-        android.widget.Toast.makeText(this, "Menu: coming soon", android.widget.Toast.LENGTH_SHORT).show()
+    private fun saveAnchor(isLeft: Boolean) {
+        val ratioY = params.y.toFloat() / maxOf(1, screenHeight - bubbleSizePx)
+        prefs.edit()
+            .putFloat("anchor_edge", if (isLeft) 0f else 1f)
+            .putFloat("ratio_y", ratioY.coerceIn(0f, 1f))
+            .apply()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -155,7 +266,7 @@ class AssistiveTouchService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (::bubble.isInitialized) {
+        if (::bubble.isInitialized && ::windowManager.isInitialized) {
             windowManager.removeView(bubble)
         }
     }
