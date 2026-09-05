@@ -24,13 +24,13 @@ class AssistiveTouchService : AccessibilityService() {
     private lateinit var glyph: android.widget.ImageView
     private lateinit var params: WindowManager.LayoutParams
     private lateinit var prefs: SharedPreferences
-    private lateinit var vibrator: Vibrator
+    private var vibrator: Vibrator? = null
 
     private var screenWidth = 0
     private var screenHeight = 0
     private var bubbleSizePx = 0
+    private var moveThresholdPx = 0
 
-    // gesture tracking
     private var downRawX = 0f
     private var downRawY = 0f
     private var initialX = 0
@@ -50,7 +50,7 @@ class AssistiveTouchService : AccessibilityService() {
     companion object {
         const val TAP_MAX_MS = 200L
         const val HOLD_MIN_MS = 300L
-        const val MOVE_THRESHOLD_PX = 20
+        const val MOVE_THRESHOLD_DP = 30
         const val SWIPE_THRESHOLD_PX = 60
     }
 
@@ -58,18 +58,24 @@ class AssistiveTouchService : AccessibilityService() {
         super.onServiceConnected()
         prefs = getSharedPreferences("assistive_touch_prefs", Context.MODE_PRIVATE)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
-            vm.defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+
+        vibrator = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                vm?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            }
+        } catch (e: Exception) {
+            null
         }
 
         measureScreen()
 
         val density = resources.displayMetrics.density
         bubbleSizePx = (56 * density).toInt()
+        moveThresholdPx = (MOVE_THRESHOLD_DP * density).toInt()
 
         glyph = android.widget.ImageView(this).apply {
             val glyphSize = (24 * density).toInt()
@@ -86,7 +92,7 @@ class AssistiveTouchService : AccessibilityService() {
         }
         applyIdleAppearance()
 
-        val savedRatioX = prefs.getFloat("anchor_edge", 1f) // 0f = left, 1f = right
+        val savedRatioX = prefs.getFloat("anchor_edge", 1f)
         val savedRatioY = prefs.getFloat("ratio_y", 0.5f)
 
         val startX = if (savedRatioX <= 0f) 0 else screenWidth - bubbleSizePx
@@ -121,7 +127,6 @@ class AssistiveTouchService : AccessibilityService() {
         super.onConfigurationChanged(newConfig)
         if (!::windowManager.isInitialized || !::bubble.isInitialized) return
 
-        // re-measure after rotation and re-anchor using saved ratios (not stale pixels)
         handler.postDelayed({
             measureScreen()
             val anchorEdge = prefs.getFloat("anchor_edge", 1f)
@@ -136,11 +141,17 @@ class AssistiveTouchService : AccessibilityService() {
     }
 
     private fun vibrate() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(VibrationEffect.createOneShot(20, VibrationEffect.DEFAULT_AMPLITUDE))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(20)
+        val v = vibrator ?: return
+        if (!v.hasVibrator()) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                v.vibrate(VibrationEffect.createOneShot(35, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                v.vibrate(35)
+            }
+        } catch (e: Exception) {
+            // device may block vibration in some silent modes; fail silently
         }
     }
 
@@ -148,17 +159,17 @@ class AssistiveTouchService : AccessibilityService() {
         bubble.background = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = 18 * resources.displayMetrics.density
-            setColor(Color.argb(102, 20, 20, 22)) // ~40% opacity dark
-            setStroke((1 * resources.displayMetrics.density).toInt(), Color.argb(64, 255, 255, 255))
+            setColor(Color.argb(64, 20, 20, 22)) // ~25% opacity dark
+            setStroke((1 * resources.displayMetrics.density).toInt(), Color.argb(50, 255, 255, 255))
         }
-        (glyph.background as GradientDrawable).setColor(Color.WHITE)
+        (glyph.background as GradientDrawable).setColor(Color.argb(200, 255, 255, 255))
     }
 
     private fun applyTouchedAppearance() {
         bubble.background = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = 18 * resources.displayMetrics.density
-            setColor(Color.argb(242, 255, 255, 255)) // ~95% opacity white
+            setColor(Color.argb(242, 255, 255, 255))
             setStroke((1 * resources.displayMetrics.density).toInt(), Color.argb(77, 0, 0, 0))
         }
         (glyph.background as GradientDrawable).setColor(Color.BLACK)
@@ -183,7 +194,7 @@ class AssistiveTouchService : AccessibilityService() {
                 val dx = event.rawX - downRawX
                 val dy = event.rawY - downRawY
 
-                if (!moved && (abs(dx) > MOVE_THRESHOLD_PX || abs(dy) > MOVE_THRESHOLD_PX)) {
+                if (!moved && (abs(dx) > moveThresholdPx || abs(dy) > moveThresholdPx)) {
                     moved = true
                     if (!longPressTriggered) handler.removeCallbacks(longPressRunnable)
                 }
