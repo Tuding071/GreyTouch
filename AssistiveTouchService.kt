@@ -49,9 +49,9 @@ class AssistiveTouchService : AccessibilityService() {
 
     companion object {
         const val TAP_MAX_MS = 200L
-        const val HOLD_MIN_MS = 300L
-        const val MOVE_THRESHOLD_DP = 30
-        const val SWIPE_THRESHOLD_PX = 60
+        const val HOLD_MIN_MS = 220L
+        const val MOVE_THRESHOLD_DP = 50
+        const val SWIPE_THRESHOLD_PX = 80
     }
 
     override fun onServiceConnected() {
