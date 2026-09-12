@@ -104,23 +104,33 @@ jobs:
           package com.grey.touch
 
           import android.accessibilityservice.AccessibilityService
+          import android.annotation.SuppressLint
           import android.content.Context
           import android.content.Intent
           import android.content.SharedPreferences
           import android.content.res.Configuration
+          import android.graphics.Bitmap
           import android.graphics.Color
           import android.graphics.PixelFormat
           import android.graphics.drawable.GradientDrawable
           import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
           import android.os.VibrationEffect
           import android.os.Vibrator
           import android.os.VibratorManager
+          import android.util.Base64
           import android.util.DisplayMetrics
           import android.view.*
           import android.view.accessibility.AccessibilityEvent
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
           import android.widget.FrameLayout
           import android.widget.LinearLayout
           import android.widget.TextView
+          import java.io.ByteArrayOutputStream
+          import java.text.SimpleDateFormat
+          import java.util.*
           import kotlin.math.abs
 
           class AssistiveTouchService : AccessibilityService() {
@@ -135,7 +145,12 @@ jobs:
               private var vibrator: Vibrator? = null
 
               private var menuView: FrameLayout? = null
-              private var menuParams: WindowManager.LayoutParams? = null
+              private var screensaverView: FrameLayout? = null
+              private var screensaverClock: TextView? = null
+              private var screensaverAmPm: TextView? = null
+              private var screensaverHandler: Handler? = null
+              private var lensView: WebView? = null
+              private var lensOverlay: FrameLayout? = null
 
               private var screenWidth = 0
               private var screenHeight = 0
@@ -150,9 +165,13 @@ jobs:
               private var isDragging = false
               private var longPressTriggered = false
               private var moved = false
-              private var lastTapUpTime = 0L
+              private var pendingTapRunnable: Runnable? = null
 
-              private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+              private var keyboardVisible = false
+              private var preKeyboardX = 0
+              private var preKeyboardY = 0
+
+              private val handler = Handler(Looper.getMainLooper())
               private val longPressRunnable = Runnable {
                   longPressTriggered = true
                   isDragging = true
@@ -162,7 +181,7 @@ jobs:
               companion object {
                   const val TAP_MAX_MS = 200L
                   const val HOLD_MIN_MS = 210L
-                  const val DOUBLE_TAP_GAP_MS = 200L
+                  const val DOUBLE_TAP_WINDOW_MS = 200L
                   const val MOVE_THRESHOLD_DP = 50
                   const val SWIPE_THRESHOLD_PX = 60
               }
@@ -214,6 +233,10 @@ jobs:
 
                   bubbleContainer.setOnTouchListener { _, event -> handleTouch(event) }
                   windowManager.addView(bubbleContainer, params)
+
+                  serviceInfo = serviceInfo?.apply {
+                      eventTypes = AccessibilityEvent.TYPES_ALL_MASK
+                  }
               }
 
               private fun buildBubbleViews(density: Float) {
@@ -265,6 +288,38 @@ jobs:
                   }, 150L)
               }
 
+              // ---------- Keyboard avoidance ----------
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  checkKeyboardState()
+              }
+
+              private fun checkKeyboardState() {
+                  if (!::windowManager.isInitialized || !::bubbleContainer.isInitialized) return
+                  try {
+                      val imeWindow = windows?.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+                      if (imeWindow != null) {
+                          val bounds = android.graphics.Rect()
+                          imeWindow.getBoundsInScreen(bounds)
+                          if (!keyboardVisible) {
+                              keyboardVisible = true
+                              preKeyboardX = params.x
+                              preKeyboardY = params.y
+                          }
+                          val keyboardTop = bounds.top
+                          if (params.y + bubbleSizePx > keyboardTop) {
+                              params.y = (keyboardTop - bubbleSizePx - 8).coerceAtLeast(0)
+                              windowManager.updateViewLayout(bubbleContainer, params)
+                          }
+                      } else if (keyboardVisible) {
+                          keyboardVisible = false
+                          params.y = preKeyboardY.coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
+                          windowManager.updateViewLayout(bubbleContainer, params)
+                      }
+                  } catch (e: Exception) {
+                  }
+              }
+
               private fun vibrate(durationMs: Long = 35) {
                   val v = vibrator ?: return
                   if (!v.hasVibrator()) return
@@ -306,6 +361,8 @@ jobs:
                   }
               }
 
+              // ---------- Swipe-down menu ----------
+
               private fun showMenu() {
                   if (menuView != null) return
                   val density = resources.displayMetrics.density
@@ -334,7 +391,7 @@ jobs:
 
                   val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
                   row1.addView(menuTile("Screensaver") { hideMenu(); startScreensaver() })
-                  row1.addView(menuTile("Screenshot") { hideMenu() })
+                  row1.addView(menuTile("Screenshot") { hideMenu(); takeScreenshotAction(saveForLens = false) })
 
                   val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
                   row2.addView(menuTile("Vol -") { adjustVolume(false) })
@@ -344,7 +401,7 @@ jobs:
                   row3.addView(menuTile("Bright -") { adjustBrightness(false) })
                   row3.addView(menuTile("Bright +") { adjustBrightness(true) })
 
-                  val row4 = menuTile("Screen Search") { hideMenu() }
+                  val row4 = menuTile("Screen Search") { hideMenu(); takeScreenshotAction(saveForLens = true) }
 
                   card.addView(row1)
                   card.addView(spacer(density))
@@ -356,7 +413,7 @@ jobs:
 
                   overlay.addView(card)
 
-                  menuParams = WindowManager.LayoutParams(
+                  val menuParams = WindowManager.LayoutParams(
                       WindowManager.LayoutParams.MATCH_PARENT,
                       WindowManager.LayoutParams.MATCH_PARENT,
                       WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -373,7 +430,6 @@ jobs:
                       try { windowManager.removeView(it) } catch (e: Exception) {}
                   }
                   menuView = null
-                  menuParams = null
               }
 
               private fun spacer(density: Float): View {
@@ -427,7 +483,7 @@ jobs:
                           resolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, 128
                       )
                       val step = 25
-                      val newVal = (current + if (up) step else -step).coerceIn(10, 255)
+                      val newVal = (current + if (up) step else -step).coerceIn(1, 255)
                       android.provider.Settings.System.putInt(
                           resolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, newVal
                       )
@@ -439,9 +495,254 @@ jobs:
                   }
               }
 
-              private fun startScreensaver() {
-                  android.widget.Toast.makeText(this, "Screensaver coming next", android.widget.Toast.LENGTH_SHORT).show()
+              // ---------- Screenshot / Screen Search ----------
+
+              private fun takeScreenshotAction(saveForLens: Boolean) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                      android.widget.Toast.makeText(this, "Screenshot requires Android 11+", android.widget.Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  takeScreenshot(
+                      android.view.Display.DEFAULT_DISPLAY,
+                      mainExecutor,
+                      object : TakeScreenshotCallback {
+                          override fun onSuccess(result: ScreenshotResult) {
+                              val hardwareBitmap = Bitmap.wrapHardwareBuffer(
+                                  result.hardwareBuffer, result.colorSpace
+                              )
+                              val bitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                              result.hardwareBuffer.close()
+
+                              if (bitmap == null) {
+                                  android.widget.Toast.makeText(this@AssistiveTouchService, "Screenshot failed", android.widget.Toast.LENGTH_SHORT).show()
+                                  return
+                              }
+
+                              if (saveForLens) {
+                                  openLensWithBitmap(bitmap)
+                              } else {
+                                  android.widget.Toast.makeText(this@AssistiveTouchService, "Screenshot captured", android.widget.Toast.LENGTH_SHORT).show()
+                              }
+                          }
+
+                          override fun onFailure(errorCode: Int) {
+                              android.widget.Toast.makeText(this@AssistiveTouchService, "Screenshot failed", android.widget.Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                  )
               }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun openLensWithBitmap(bitmap: Bitmap) {
+                  val outputStream = ByteArrayOutputStream()
+                  bitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
+                  val base64 = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
+                  bitmap.recycle()
+
+                  val overlay = FrameLayout(this).apply {
+                      setBackgroundColor(Color.BLACK)
+                  }
+
+                  val closeBtn = TextView(this).apply {
+                      text = "Close"
+                      setTextColor(Color.WHITE)
+                      textSize = 14f
+                      val density = resources.displayMetrics.density
+                      setPadding((16 * density).toInt(), (12 * density).toInt(), (16 * density).toInt(), (12 * density).toInt())
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.RECTANGLE
+                          cornerRadius = 12 * density
+                          setColor(Color.argb(180, 40, 40, 40))
+                      }
+                      layoutParams = FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.WRAP_CONTENT,
+                          FrameLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          gravity = Gravity.TOP or Gravity.END
+                          val m = (24 * density).toInt()
+                          setMargins(0, m, m, 0)
+                      }
+                      setOnClickListener { closeLens() }
+                  }
+
+                  val webView = WebView(this).apply {
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = true
+                      webViewClient = object : WebViewClient() {
+                          override fun onPageFinished(view: WebView?, url: String?) {
+                              super.onPageFinished(view, url)
+                              injectImageIntoLens(view, base64)
+                          }
+                      }
+                      loadUrl("https://lens.google.com/upload")
+                  }
+
+                  overlay.addView(webView, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.MATCH_PARENT,
+                      FrameLayout.LayoutParams.MATCH_PARENT
+                  ))
+                  overlay.addView(closeBtn)
+
+                  val lensParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.OPAQUE
+                  )
+
+                  windowManager.addView(overlay, lensParams)
+                  lensOverlay = overlay
+                  lensView = webView
+              }
+
+              private fun injectImageIntoLens(view: WebView?, base64: String) {
+                  val js = """
+                      (function() {
+                          function dataURLtoFile(dataurl, filename) {
+                              var arr = dataurl.split(','), mime = 'image/jpeg',
+                                  bstr = atob(arr[0]), n = bstr.length, u8arr = new Uint8Array(n);
+                              while (n--) { u8arr[n] = bstr.charCodeAt(n); }
+                              return new File([u8arr], filename, {type: mime});
+                          }
+                          var file = dataURLtoFile('data:image/jpeg;base64,$base64', 'screenshot.jpg');
+                          var dt = new DataTransfer();
+                          dt.items.add(file);
+                          var input = document.querySelector('input[type="file"]');
+                          if (input) {
+                              input.files = dt.files;
+                              var event = new Event('change', { bubbles: true });
+                              input.dispatchEvent(event);
+                          }
+                      })();
+                  """.trimIndent()
+                  view?.evaluateJavascript(js, null)
+              }
+
+              private fun closeLens() {
+                  lensOverlay?.let {
+                      try { windowManager.removeView(it) } catch (e: Exception) {}
+                  }
+                  lensView?.destroy()
+                  lensView = null
+                  lensOverlay = null
+              }
+
+              // ---------- Screensaver ----------
+
+              private fun startScreensaver() {
+                  if (screensaverView != null) return
+                  val density = resources.displayMetrics.density
+                  val edgeMargin = (24 * density).toInt()
+
+                  val overlay = FrameLayout(this).apply {
+                      setBackgroundColor(Color.BLACK)
+                  }
+
+                  val clockContainer = FrameLayout(this)
+
+                  val clock = TextView(this).apply {
+                      textSize = 34f
+                      setTextColor(Color.argb(140, 255, 255, 255))
+                      gravity = Gravity.CENTER
+                  }
+                  val ampm = TextView(this).apply {
+                      textSize = 12f
+                      setTextColor(Color.argb(90, 255, 255, 255))
+                      gravity = Gravity.CENTER
+                  }
+
+                  val textWrap = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      addView(clock)
+                      addView(ampm)
+                      layoutParams = FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.WRAP_CONTENT,
+                          FrameLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { gravity = Gravity.CENTER }
+                  }
+                  clockContainer.addView(textWrap)
+
+                  overlay.addView(clockContainer, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.MATCH_PARENT,
+                      FrameLayout.LayoutParams.MATCH_PARENT
+                  ))
+
+                  screensaverView = overlay
+                  screensaverClock = clock
+                  screensaverAmPm = ampm
+
+                  var touchStartY = 0f
+                  overlay.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              touchStartY = event.y
+                              val safeTop = edgeMargin * 2
+                              val safeBottom = screenHeight - edgeMargin * 2
+                              if (event.y < safeTop || event.y > safeBottom) return@setOnTouchListener true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              val dy = touchStartY - event.y
+                              if (dy > SWIPE_THRESHOLD_PX) {
+                                  exitScreensaver()
+                              }
+                          }
+                      }
+                      true
+                  }
+
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.OPAQUE
+                  )
+                  windowManager.addView(overlay, lp)
+
+                  updateScreensaverClock()
+                  screensaverHandler = Handler(Looper.getMainLooper())
+                  scheduleClockTick()
+              }
+
+              private var clockStopIndex = 0
+              private fun scheduleClockTick() {
+                  screensaverHandler?.postDelayed({
+                      updateScreensaverClock()
+                      scheduleClockTick()
+                  }, 60_000L)
+              }
+
+              private fun updateScreensaverClock() {
+                  val sdf = SimpleDateFormat("hh:mm", Locale.getDefault())
+                  val ampmFmt = SimpleDateFormat("a", Locale.getDefault())
+                  val now = Date()
+                  screensaverClock?.text = sdf.format(now)
+                  screensaverAmPm?.text = ampmFmt.format(now)
+
+                  val density = resources.displayMetrics.density
+                  val stops = listOf(-40, 0, 40)
+                  val offset = stops[clockStopIndex % stops.size]
+                  clockStopIndex++
+
+                  val parent = screensaverClock?.parent?.parent as? LinearLayout
+                  parent?.translationY = offset * density
+              }
+
+              private fun exitScreensaver() {
+                  screensaverHandler?.removeCallbacksAndMessages(null)
+                  screensaverHandler = null
+                  screensaverView?.let {
+                      try { windowManager.removeView(it) } catch (e: Exception) {}
+                  }
+                  screensaverView = null
+                  screensaverClock = null
+                  screensaverAmPm = null
+                  clockStopIndex = 0
+              }
+
+              // ---------- Gesture handling ----------
 
               private fun handleTouch(event: MotionEvent): Boolean {
                   when (event.action) {
@@ -481,20 +782,25 @@ jobs:
                           val dx = event.rawX - downRawX
                           val dy = event.rawY - downRawY
                           val elapsed = System.currentTimeMillis() - downTime
-                          val upTime = System.currentTimeMillis()
 
                           if (isDragging) {
                               snapToNearestEdge()
                           } else if (!moved && elapsed < TAP_MAX_MS) {
-                              val gapSinceLastTap = upTime - lastTapUpTime
-                              if (gapSinceLastTap < DOUBLE_TAP_GAP_MS) {
+                              if (pendingTapRunnable != null) {
+                                  // second tap arrived within window -> double tap -> lock
+                                  handler.removeCallbacks(pendingTapRunnable!!)
+                                  pendingTapRunnable = null
                                   vibrate(45)
                                   lockPhone()
-                                  lastTapUpTime = 0L
                               } else {
-                                  vibrate()
-                                  performGlobalAction(GLOBAL_ACTION_BACK)
-                                  lastTapUpTime = upTime
+                                  // first tap -> wait to see if a second tap comes
+                                  val runnable = Runnable {
+                                      vibrate()
+                                      performGlobalAction(GLOBAL_ACTION_BACK)
+                                      pendingTapRunnable = null
+                                  }
+                                  pendingTapRunnable = runnable
+                                  handler.postDelayed(runnable, DOUBLE_TAP_WINDOW_MS)
                               }
                           } else {
                               val swipedUp = dy < -SWIPE_THRESHOLD_PX && abs(dy) > abs(dx)
@@ -547,12 +853,13 @@ jobs:
                       .apply()
               }
 
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
               override fun onInterrupt() {}
 
               override fun onDestroy() {
                   super.onDestroy()
                   hideMenu()
+                  exitScreensaver()
+                  closeLens()
                   if (::bubbleContainer.isInitialized && ::windowManager.isInitialized) {
                       windowManager.removeView(bubbleContainer)
                   }
@@ -566,6 +873,7 @@ jobs:
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.VIBRATE" />
               <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+              <uses-permission android:name="android.permission.INTERNET" />
 
               <application
                   android:allowBackup="true"
@@ -657,7 +965,7 @@ jobs:
 
               defaultConfig {
                   applicationId = "com.grey.touch"
-                  minSdk = 28
+                  minSdk = 30
                   targetSdk = 34
                   versionCode = (project.findProperty("BUILD_NUMBER") as String? ?: "1").toInt()
                   versionName = "1.0.${project.findProperty("BUILD_NUMBER") as String? ?: "1"}"
