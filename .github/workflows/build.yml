@@ -1,1 +1,739 @@
-7
+name: Build AssistiveTouch APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Generate project structure
+        run: |
+          mkdir -p app/src/main/java/com/grey/touch
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          mkdir -p app/src/main/res/drawable
+
+          cat > app/src/main/java/com/grey/touch/MainActivity.kt << 'KOTLIN_EOF'
+          package com.grey.touch
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.TextUtils
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme {
+                          Surface(modifier = Modifier.fillMaxSize()) {
+                              var enabled by remember { mutableStateOf(isServiceEnabled()) }
+
+                              Column(
+                                  modifier = Modifier.fillMaxSize().padding(24.dp),
+                                  horizontalAlignment = Alignment.CenterHorizontally,
+                                  verticalArrangement = Arrangement.Center
+                              ) {
+                                  Text(
+                                      text = if (enabled) "AssistiveTouch is enabled" else "AssistiveTouch is not enabled",
+                                      style = MaterialTheme.typography.titleLarge
+                                  )
+                                  Spacer(modifier = Modifier.height(16.dp))
+                                  Text(
+                                      text = "This app needs Accessibility permission to show the floating bubble and control back/recents.",
+                                      style = MaterialTheme.typography.bodyMedium
+                                  )
+                                  Spacer(modifier = Modifier.height(24.dp))
+                                  Button(onClick = {
+                                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                                  }) {
+                                      Text("Open Accessibility Settings")
+                                  }
+                              }
+
+                              LaunchedEffect(Unit) {
+                                  enabled = isServiceEnabled()
+                              }
+                          }
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  recreate()
+              }
+
+              private fun isServiceEnabled(): Boolean {
+                  val expected = "$packageName/${AssistiveTouchService::class.java.canonicalName}"
+                  val enabledServices = Settings.Secure.getString(
+                      contentResolver,
+                      Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  val splitter = TextUtils.SimpleStringSplitter(':')
+                  splitter.setString(enabledServices)
+                  while (splitter.hasNext()) {
+                      if (splitter.next().equals(expected, ignoreCase = true)) return true
+                  }
+                  return false
+              }
+          }
+          KOTLIN_EOF
+
+          cat > app/src/main/java/com/grey/touch/AssistiveTouchService.kt << 'KOTLIN_EOF'
+          package com.grey.touch
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.res.Configuration
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.os.VibratorManager
+          import android.util.DisplayMetrics
+          import android.view.*
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.math.abs
+
+          class AssistiveTouchService : AccessibilityService() {
+
+              private lateinit var windowManager: WindowManager
+              private lateinit var bubbleContainer: FrameLayout
+              private lateinit var ringOuter: View
+              private lateinit var ringMiddle: View
+              private lateinit var ringCore: View
+              private lateinit var params: WindowManager.LayoutParams
+              private lateinit var prefs: SharedPreferences
+              private var vibrator: Vibrator? = null
+
+              private var menuView: FrameLayout? = null
+              private var menuParams: WindowManager.LayoutParams? = null
+
+              private var screenWidth = 0
+              private var screenHeight = 0
+              private var bubbleSizePx = 0
+              private var moveThresholdPx = 0
+
+              private var downRawX = 0f
+              private var downRawY = 0f
+              private var initialX = 0
+              private var initialY = 0
+              private var downTime = 0L
+              private var isDragging = false
+              private var longPressTriggered = false
+              private var moved = false
+              private var lastTapUpTime = 0L
+
+              private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+              private val longPressRunnable = Runnable {
+                  longPressTriggered = true
+                  isDragging = true
+                  vibrate()
+              }
+
+              companion object {
+                  const val TAP_MAX_MS = 200L
+                  const val HOLD_MIN_MS = 210L
+                  const val DOUBLE_TAP_GAP_MS = 200L
+                  const val MOVE_THRESHOLD_DP = 50
+                  const val SWIPE_THRESHOLD_PX = 60
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  prefs = getSharedPreferences("assistive_touch_prefs", Context.MODE_PRIVATE)
+                  windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
+                  vibrator = try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                          val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                          vm?.defaultVibrator
+                      } else {
+                          @Suppress("DEPRECATION")
+                          getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                      }
+                  } catch (e: Exception) {
+                      null
+                  }
+
+                  measureScreen()
+
+                  val density = resources.displayMetrics.density
+                  bubbleSizePx = (56 * density).toInt()
+                  moveThresholdPx = (MOVE_THRESHOLD_DP * density).toInt()
+
+                  buildBubbleViews(density)
+                  applyIdleAppearance()
+
+                  val savedRatioX = prefs.getFloat("anchor_edge", 1f)
+                  val savedRatioY = prefs.getFloat("ratio_y", 0.5f)
+
+                  val startX = if (savedRatioX <= 0f) 0 else screenWidth - bubbleSizePx
+                  val startY = ((screenHeight - bubbleSizePx) * savedRatioY).toInt()
+
+                  params = WindowManager.LayoutParams(
+                      bubbleSizePx,
+                      bubbleSizePx,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = startX
+                      y = startY.coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
+                  }
+
+                  bubbleContainer.setOnTouchListener { _, event -> handleTouch(event) }
+                  windowManager.addView(bubbleContainer, params)
+              }
+
+              private fun buildBubbleViews(density: Float) {
+                  bubbleContainer = FrameLayout(this)
+
+                  ringOuter = View(this).apply {
+                      layoutParams = FrameLayout.LayoutParams(bubbleSizePx, bubbleSizePx)
+                  }
+                  val midSize = (bubbleSizePx * 0.68f).toInt()
+                  ringMiddle = View(this).apply {
+                      layoutParams = FrameLayout.LayoutParams(midSize, midSize).apply {
+                          gravity = Gravity.CENTER
+                      }
+                  }
+                  val coreSize = (bubbleSizePx * 0.36f).toInt()
+                  ringCore = View(this).apply {
+                      layoutParams = FrameLayout.LayoutParams(coreSize, coreSize).apply {
+                          gravity = Gravity.CENTER
+                      }
+                  }
+
+                  bubbleContainer.addView(ringOuter)
+                  bubbleContainer.addView(ringMiddle)
+                  bubbleContainer.addView(ringCore)
+              }
+
+              private fun measureScreen() {
+                  val metrics = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  windowManager.defaultDisplay.getMetrics(metrics)
+                  screenWidth = metrics.widthPixels
+                  screenHeight = metrics.heightPixels
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  if (!::windowManager.isInitialized || !::bubbleContainer.isInitialized) return
+
+                  handler.postDelayed({
+                      measureScreen()
+                      val anchorEdge = prefs.getFloat("anchor_edge", 1f)
+                      val ratioY = prefs.getFloat("ratio_y", 0.5f)
+
+                      params.x = if (anchorEdge <= 0f) 0 else screenWidth - bubbleSizePx
+                      params.y = ((screenHeight - bubbleSizePx) * ratioY).toInt()
+                          .coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
+
+                      windowManager.updateViewLayout(bubbleContainer, params)
+                  }, 150L)
+              }
+
+              private fun vibrate(durationMs: Long = 35) {
+                  val v = vibrator ?: return
+                  if (!v.hasVibrator()) return
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          v.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE))
+                      } else {
+                          @Suppress("DEPRECATION")
+                          v.vibrate(durationMs)
+                      }
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun circleDrawable(color: Int): GradientDrawable {
+                  return GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(color)
+                  }
+              }
+
+              private fun applyIdleAppearance() {
+                  ringOuter.background = circleDrawable(Color.argb(90, 20, 20, 25))
+                  ringMiddle.background = circleDrawable(Color.argb(100, 120, 120, 128))
+                  ringCore.background = circleDrawable(Color.argb(130, 255, 255, 255))
+              }
+
+              private fun applyTouchedAppearance() {
+                  ringOuter.background = circleDrawable(Color.argb(242, 20, 20, 25))
+                  ringMiddle.background = circleDrawable(Color.argb(242, 150, 150, 158))
+                  ringCore.background = circleDrawable(Color.WHITE)
+              }
+
+              private fun lockPhone() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                      performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+                  } else {
+                      android.widget.Toast.makeText(this, "Lock requires Android 9+", android.widget.Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun showMenu() {
+                  if (menuView != null) return
+                  val density = resources.displayMetrics.density
+
+                  val overlay = FrameLayout(this).apply {
+                      setOnClickListener { hideMenu() }
+                  }
+
+                  val card = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.RECTANGLE
+                          cornerRadius = 16 * density
+                          setColor(Color.argb(245, 32, 32, 35))
+                      }
+                      val pad = (16 * density).toInt()
+                      setPadding(pad, pad, pad, pad)
+                      layoutParams = FrameLayout.LayoutParams(
+                          (240 * density).toInt(),
+                          FrameLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          gravity = Gravity.CENTER
+                      }
+                      isClickable = true
+                  }
+
+                  val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  row1.addView(menuTile("Screensaver") { hideMenu(); startScreensaver() })
+                  row1.addView(menuTile("Screenshot") { hideMenu() })
+
+                  val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  row2.addView(menuTile("Vol -") { adjustVolume(false) })
+                  row2.addView(menuTile("Vol +") { adjustVolume(true) })
+
+                  val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  row3.addView(menuTile("Bright -") { adjustBrightness(false) })
+                  row3.addView(menuTile("Bright +") { adjustBrightness(true) })
+
+                  val row4 = menuTile("Screen Search") { hideMenu() }
+
+                  card.addView(row1)
+                  card.addView(spacer(density))
+                  card.addView(row2)
+                  card.addView(spacer(density))
+                  card.addView(row3)
+                  card.addView(spacer(density))
+                  card.addView(row4)
+
+                  overlay.addView(card)
+
+                  menuParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  )
+
+                  windowManager.addView(overlay, menuParams)
+                  menuView = overlay
+              }
+
+              private fun hideMenu() {
+                  menuView?.let {
+                      try { windowManager.removeView(it) } catch (e: Exception) {}
+                  }
+                  menuView = null
+                  menuParams = null
+              }
+
+              private fun spacer(density: Float): View {
+                  return View(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          (8 * density).toInt()
+                      )
+                  }
+              }
+
+              private fun menuTile(label: String, onClick: () -> Unit): View {
+                  val density = resources.displayMetrics.density
+                  return TextView(this).apply {
+                      text = label
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      gravity = Gravity.CENTER
+                      val padV = (12 * density).toInt()
+                      setPadding(padV, padV, padV, padV)
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.RECTANGLE
+                          cornerRadius = 12 * density
+                          setColor(Color.argb(60, 255, 255, 255))
+                      }
+                      layoutParams = LinearLayout.LayoutParams(
+                          0,
+                          LinearLayout.LayoutParams.WRAP_CONTENT,
+                          1f
+                      ).apply {
+                          val m = (4 * density).toInt()
+                          setMargins(m, 0, m, 0)
+                      }
+                      setOnClickListener { onClick() }
+                  }
+              }
+
+              private fun adjustVolume(up: Boolean) {
+                  val audioManager = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+                  audioManager.adjustStreamVolume(
+                      android.media.AudioManager.STREAM_MUSIC,
+                      if (up) android.media.AudioManager.ADJUST_RAISE else android.media.AudioManager.ADJUST_LOWER,
+                      android.media.AudioManager.FLAG_SHOW_UI
+                  )
+              }
+
+              private fun adjustBrightness(up: Boolean) {
+                  try {
+                      val resolver = contentResolver
+                      val current = android.provider.Settings.System.getInt(
+                          resolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, 128
+                      )
+                      val step = 25
+                      val newVal = (current + if (up) step else -step).coerceIn(10, 255)
+                      android.provider.Settings.System.putInt(
+                          resolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, newVal
+                      )
+                  } catch (e: SecurityException) {
+                      val intent = Intent(android.provider.Settings.ACTION_MANAGE_WRITE_SETTINGS)
+                      intent.data = android.net.Uri.parse("package:$packageName")
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(intent)
+                  }
+              }
+
+              private fun startScreensaver() {
+                  android.widget.Toast.makeText(this, "Screensaver coming next", android.widget.Toast.LENGTH_SHORT).show()
+              }
+
+              private fun handleTouch(event: MotionEvent): Boolean {
+                  when (event.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          downRawX = event.rawX
+                          downRawY = event.rawY
+                          initialX = params.x
+                          initialY = params.y
+                          downTime = System.currentTimeMillis()
+                          isDragging = false
+                          longPressTriggered = false
+                          moved = false
+                          applyTouchedAppearance()
+                          handler.postDelayed(longPressRunnable, HOLD_MIN_MS)
+                          return true
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          val dx = event.rawX - downRawX
+                          val dy = event.rawY - downRawY
+
+                          if (!moved && (abs(dx) > moveThresholdPx || abs(dy) > moveThresholdPx)) {
+                              moved = true
+                              if (!longPressTriggered) handler.removeCallbacks(longPressRunnable)
+                          }
+
+                          if (isDragging) {
+                              params.x = (initialX + dx.toInt()).coerceIn(0, screenWidth - bubbleSizePx)
+                              params.y = (initialY + dy.toInt()).coerceIn(0, screenHeight - bubbleSizePx)
+                              windowManager.updateViewLayout(bubbleContainer, params)
+                          }
+                          return true
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                          handler.removeCallbacks(longPressRunnable)
+                          applyIdleAppearance()
+
+                          val dx = event.rawX - downRawX
+                          val dy = event.rawY - downRawY
+                          val elapsed = System.currentTimeMillis() - downTime
+                          val upTime = System.currentTimeMillis()
+
+                          if (isDragging) {
+                              snapToNearestEdge()
+                          } else if (!moved && elapsed < TAP_MAX_MS) {
+                              val gapSinceLastTap = upTime - lastTapUpTime
+                              if (gapSinceLastTap < DOUBLE_TAP_GAP_MS) {
+                                  vibrate(45)
+                                  lockPhone()
+                                  lastTapUpTime = 0L
+                              } else {
+                                  vibrate()
+                                  performGlobalAction(GLOBAL_ACTION_BACK)
+                                  lastTapUpTime = upTime
+                              }
+                          } else {
+                              val swipedUp = dy < -SWIPE_THRESHOLD_PX && abs(dy) > abs(dx)
+                              val swipedDown = dy > SWIPE_THRESHOLD_PX && abs(dy) > abs(dx)
+                              when {
+                                  swipedUp -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+                                  swipedDown -> showMenu()
+                              }
+                          }
+                          isDragging = false
+                          return true
+                      }
+                  }
+                  return false
+              }
+
+              private fun snapToNearestEdge() {
+                  val centerX = params.x + bubbleSizePx / 2
+                  val snapToLeft = centerX < screenWidth / 2
+                  val targetX = if (snapToLeft) 0 else screenWidth - bubbleSizePx
+
+                  val startX = params.x
+                  val distance = targetX - startX
+                  val steps = 8
+                  var step = 0
+
+                  val animator = object : Runnable {
+                      override fun run() {
+                          step++
+                          val progress = step.toFloat() / steps
+                          params.x = (startX + distance * progress).toInt()
+                          windowManager.updateViewLayout(bubbleContainer, params)
+                          if (step < steps) {
+                              handler.postDelayed(this, 8L)
+                          } else {
+                              params.x = targetX
+                              windowManager.updateViewLayout(bubbleContainer, params)
+                              saveAnchor(snapToLeft)
+                          }
+                      }
+                  }
+                  handler.post(animator)
+              }
+
+              private fun saveAnchor(isLeft: Boolean) {
+                  val ratioY = params.y.toFloat() / maxOf(1, screenHeight - bubbleSizePx)
+                  prefs.edit()
+                      .putFloat("anchor_edge", if (isLeft) 0f else 1f)
+                      .putFloat("ratio_y", ratioY.coerceIn(0f, 1f))
+                      .apply()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  hideMenu()
+                  if (::bubbleContainer.isInitialized && ::windowManager.isInitialized) {
+                      windowManager.removeView(bubbleContainer)
+                  }
+              }
+          }
+          KOTLIN_EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="AssistiveTouch"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AssistiveTouchService"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/xml/accessibility_service_config.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="false"
+              android:notificationTimeout="100"
+              android:description="@string/accessibility_service_description" />
+          EOF
+
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">AssistiveTouch</string>
+              <string name="accessibility_service_description">Enables the floating AssistiveTouch bubble for back and recent apps gestures.</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_launcher_background.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#333333" />
+          </shape>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M39,29 L69,29 A10,10 0 0,1 79,39 L79,69 A10,10 0 0,1 69,79 L39,79 A10,10 0 0,1 29,69 L29,39 A10,10 0 0,1 39,29 Z" />
+          </vector>
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+
+          cat > app/build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.grey.touch"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.grey.touch"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = (project.findProperty("BUILD_NUMBER") as String? ?: "1").toInt()
+                  versionName = "1.0.${project.findProperty("BUILD_NUMBER") as String? ?: "1"}"
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              packaging {
+                  resources.excludes.add("META-INF/*")
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+          }
+          EOF
+
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.4.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AssistiveTouch"
+          include(":app")
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build APK
+        run: |
+          chmod +x gradlew || (gradle wrapper && chmod +x gradlew)
+          ./gradlew assembleDebug -PBUILD_NUMBER=${{ github.run_number }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AssistiveTouch-debug-${{ github.run_number }}
+          path: app/build/outputs/apk/debug/app-debug.apk
