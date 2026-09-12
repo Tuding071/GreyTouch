@@ -1,7 +1,10 @@
 package com.grey.touch
 
 import android.accessibilityservice.AccessibilityService
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.graphics.Color
@@ -20,7 +23,11 @@ import kotlin.math.abs
 class AssistiveTouchService : AccessibilityService() {
 
     private lateinit var windowManager: WindowManager
-    private lateinit var bubble: FrameLayout
+    private lateinit var bubbleContainer: FrameLayout
+    private lateinit var mainCard: FrameLayout
+    private lateinit var layer1: FrameLayout
+    private lateinit var layer2: FrameLayout
+    private lateinit var layer3: FrameLayout
     private lateinit var glyph: android.widget.ImageView
     private lateinit var params: WindowManager.LayoutParams
     private lateinit var prefs: SharedPreferences
@@ -30,6 +37,7 @@ class AssistiveTouchService : AccessibilityService() {
     private var screenHeight = 0
     private var bubbleSizePx = 0
     private var moveThresholdPx = 0
+    private var offsetStepPx = 0
 
     private var downRawX = 0f
     private var downRawY = 0f
@@ -39,6 +47,7 @@ class AssistiveTouchService : AccessibilityService() {
     private var isDragging = false
     private var longPressTriggered = false
     private var moved = false
+    private var lastTapUpTime = 0L
 
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private val longPressRunnable = Runnable {
@@ -49,9 +58,10 @@ class AssistiveTouchService : AccessibilityService() {
 
     companion object {
         const val TAP_MAX_MS = 200L
-        const val HOLD_MIN_MS = 220L
+        const val HOLD_MIN_MS = 210L
+        const val DOUBLE_TAP_GAP_MS = 200L
         const val MOVE_THRESHOLD_DP = 50
-        const val SWIPE_THRESHOLD_PX = 80
+        const val SWIPE_THRESHOLD_PX = 60
     }
 
     override fun onServiceConnected() {
@@ -76,6 +86,63 @@ class AssistiveTouchService : AccessibilityService() {
         val density = resources.displayMetrics.density
         bubbleSizePx = (56 * density).toInt()
         moveThresholdPx = (MOVE_THRESHOLD_DP * density).toInt()
+        offsetStepPx = (4 * density).toInt()
+
+        buildBubbleViews(density)
+        applyIdleAppearance()
+
+        val savedRatioX = prefs.getFloat("anchor_edge", 1f)
+        val savedRatioY = prefs.getFloat("ratio_y", 0.5f)
+
+        // container is bigger than the card to leave room for the offset layers
+        val containerPad = offsetStepPx * 3
+        val containerSize = bubbleSizePx + containerPad
+
+        val startX = if (savedRatioX <= 0f) 0 else screenWidth - containerSize
+        val startY = ((screenHeight - containerSize) * savedRatioY).toInt()
+
+        params = WindowManager.LayoutParams(
+            containerSize,
+            containerSize,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = startX
+            y = startY.coerceIn(0, maxOf(0, screenHeight - containerSize))
+        }
+
+        bubbleContainer.setOnTouchListener { _, event -> handleTouch(event) }
+        windowManager.addView(bubbleContainer, params)
+    }
+
+    private fun buildBubbleViews(density: Float) {
+        val containerPad = offsetStepPx * 3
+        val containerSize = bubbleSizePx + containerPad
+
+        bubbleContainer = FrameLayout(this)
+
+        // layer3 = furthest back (most offset, most faded)
+        layer3 = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(bubbleSizePx, bubbleSizePx).apply {
+                leftMargin = offsetStepPx * 3
+                topMargin = offsetStepPx * 3
+            }
+        }
+        layer2 = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(bubbleSizePx, bubbleSizePx).apply {
+                leftMargin = offsetStepPx * 2
+                topMargin = offsetStepPx * 2
+            }
+        }
+        layer1 = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(bubbleSizePx, bubbleSizePx).apply {
+                leftMargin = offsetStepPx
+                topMargin = offsetStepPx
+            }
+        }
 
         glyph = android.widget.ImageView(this).apply {
             val glyphSize = (24 * density).toInt()
@@ -87,32 +154,18 @@ class AssistiveTouchService : AccessibilityService() {
             }
         }
 
-        bubble = FrameLayout(this).apply {
+        mainCard = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(bubbleSizePx, bubbleSizePx).apply {
+                leftMargin = 0
+                topMargin = 0
+            }
             addView(glyph)
         }
-        applyIdleAppearance()
 
-        val savedRatioX = prefs.getFloat("anchor_edge", 1f)
-        val savedRatioY = prefs.getFloat("ratio_y", 0.5f)
-
-        val startX = if (savedRatioX <= 0f) 0 else screenWidth - bubbleSizePx
-        val startY = ((screenHeight - bubbleSizePx) * savedRatioY).toInt()
-
-        params = WindowManager.LayoutParams(
-            bubbleSizePx,
-            bubbleSizePx,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = startX
-            y = startY.coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
-        }
-
-        bubble.setOnTouchListener { _, event -> handleTouch(event) }
-        windowManager.addView(bubble, params)
+        bubbleContainer.addView(layer3)
+        bubbleContainer.addView(layer2)
+        bubbleContainer.addView(layer1)
+        bubbleContainer.addView(mainCard)
     }
 
     private fun measureScreen() {
@@ -125,54 +178,78 @@ class AssistiveTouchService : AccessibilityService() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        if (!::windowManager.isInitialized || !::bubble.isInitialized) return
+        if (!::windowManager.isInitialized || !::bubbleContainer.isInitialized) return
 
         handler.postDelayed({
             measureScreen()
             val anchorEdge = prefs.getFloat("anchor_edge", 1f)
             val ratioY = prefs.getFloat("ratio_y", 0.5f)
+            val containerSize = params.width
 
-            params.x = if (anchorEdge <= 0f) 0 else screenWidth - bubbleSizePx
-            params.y = ((screenHeight - bubbleSizePx) * ratioY).toInt()
-                .coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
+            params.x = if (anchorEdge <= 0f) 0 else screenWidth - containerSize
+            params.y = ((screenHeight - containerSize) * ratioY).toInt()
+                .coerceIn(0, maxOf(0, screenHeight - containerSize))
 
-            windowManager.updateViewLayout(bubble, params)
+            windowManager.updateViewLayout(bubbleContainer, params)
         }, 150L)
     }
 
-    private fun vibrate() {
+    private fun vibrate(durationMs: Long = 35) {
         val v = vibrator ?: return
         if (!v.hasVibrator()) return
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                v.vibrate(VibrationEffect.createOneShot(35, VibrationEffect.DEFAULT_AMPLITUDE))
+                v.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE))
             } else {
                 @Suppress("DEPRECATION")
-                v.vibrate(35)
+                v.vibrate(durationMs)
             }
         } catch (e: Exception) {
-            // device may block vibration in some silent modes; fail silently
+            // ignore devices that block vibration
+        }
+    }
+
+    private fun cardDrawable(density: Float, bg: Int, borderColor: Int): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 18 * density
+            setColor(bg)
+            setStroke((1 * density).toInt(), borderColor)
         }
     }
 
     private fun applyIdleAppearance() {
-        bubble.background = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = 18 * resources.displayMetrics.density
-            setColor(Color.argb(64, 20, 20, 22)) // ~25% opacity dark
-            setStroke((1 * resources.displayMetrics.density).toInt(), Color.argb(50, 255, 255, 255))
-        }
+        val density = resources.displayMetrics.density
+        // stacked layers visible, faded, offset
+        layer3.background = cardDrawable(density, Color.argb(38, 20, 20, 22), Color.argb(30, 255, 255, 255))
+        layer2.background = cardDrawable(density, Color.argb(58, 20, 20, 22), Color.argb(40, 255, 255, 255))
+        layer1.background = cardDrawable(density, Color.argb(78, 20, 20, 22), Color.argb(50, 255, 255, 255))
+        mainCard.background = cardDrawable(density, Color.argb(153, 20, 20, 22), Color.argb(64, 255, 255, 255))
         (glyph.background as GradientDrawable).setColor(Color.argb(200, 255, 255, 255))
+
+        layer1.visibility = View.VISIBLE
+        layer2.visibility = View.VISIBLE
+        layer3.visibility = View.VISIBLE
     }
 
     private fun applyTouchedAppearance() {
-        bubble.background = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = 18 * resources.displayMetrics.density
-            setColor(Color.argb(242, 255, 255, 255))
-            setStroke((1 * resources.displayMetrics.density).toInt(), Color.argb(77, 0, 0, 0))
-        }
+        val density = resources.displayMetrics.density
+        // collapse: hide the stack, main card becomes solid inverted
+        layer1.visibility = View.INVISIBLE
+        layer2.visibility = View.INVISIBLE
+        layer3.visibility = View.INVISIBLE
+        mainCard.background = cardDrawable(density, Color.argb(242, 255, 255, 255), Color.argb(77, 0, 0, 0))
         (glyph.background as GradientDrawable).setColor(Color.BLACK)
+    }
+
+    private fun lockPhone() {
+        // Accessibility services can invoke the lock screen action directly on API 28+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+        } else {
+            // fallback for older APIs: requires device admin, not wired up by default
+            android.widget.Toast.makeText(this, "Lock requires Android 9+", android.widget.Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun handleTouch(event: MotionEvent): Boolean {
@@ -200,9 +277,9 @@ class AssistiveTouchService : AccessibilityService() {
                 }
 
                 if (isDragging) {
-                    params.x = (initialX + dx.toInt()).coerceIn(0, screenWidth - bubbleSizePx)
-                    params.y = (initialY + dy.toInt()).coerceIn(0, screenHeight - bubbleSizePx)
-                    windowManager.updateViewLayout(bubble, params)
+                    params.x = (initialX + dx.toInt()).coerceIn(0, screenWidth - params.width)
+                    params.y = (initialY + dy.toInt()).coerceIn(0, screenHeight - params.height)
+                    windowManager.updateViewLayout(bubbleContainer, params)
                 }
                 return true
             }
@@ -213,12 +290,22 @@ class AssistiveTouchService : AccessibilityService() {
                 val dx = event.rawX - downRawX
                 val dy = event.rawY - downRawY
                 val elapsed = System.currentTimeMillis() - downTime
+                val upTime = System.currentTimeMillis()
 
                 if (isDragging) {
                     snapToNearestEdge()
                 } else if (!moved && elapsed < TAP_MAX_MS) {
-                    vibrate()
-                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    // check for double tap
+                    val gapSinceLastTap = upTime - lastTapUpTime
+                    if (gapSinceLastTap < DOUBLE_TAP_GAP_MS) {
+                        vibrate(45)
+                        lockPhone()
+                        lastTapUpTime = 0L // reset so a 3rd quick tap doesn't chain
+                    } else {
+                        vibrate()
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                        lastTapUpTime = upTime
+                    }
                 } else {
                     val swipedUp = dy < -SWIPE_THRESHOLD_PX && abs(dy) > abs(dx)
                     val swipedDown = dy > SWIPE_THRESHOLD_PX && abs(dy) > abs(dx)
@@ -237,9 +324,9 @@ class AssistiveTouchService : AccessibilityService() {
     }
 
     private fun snapToNearestEdge() {
-        val centerX = params.x + bubbleSizePx / 2
+        val centerX = params.x + params.width / 2
         val snapToLeft = centerX < screenWidth / 2
-        val targetX = if (snapToLeft) 0 else screenWidth - bubbleSizePx
+        val targetX = if (snapToLeft) 0 else screenWidth - params.width
 
         val startX = params.x
         val distance = targetX - startX
@@ -251,12 +338,12 @@ class AssistiveTouchService : AccessibilityService() {
                 step++
                 val progress = step.toFloat() / steps
                 params.x = (startX + distance * progress).toInt()
-                windowManager.updateViewLayout(bubble, params)
+                windowManager.updateViewLayout(bubbleContainer, params)
                 if (step < steps) {
                     handler.postDelayed(this, 8L)
                 } else {
                     params.x = targetX
-                    windowManager.updateViewLayout(bubble, params)
+                    windowManager.updateViewLayout(bubbleContainer, params)
                     saveAnchor(snapToLeft)
                 }
             }
@@ -265,7 +352,7 @@ class AssistiveTouchService : AccessibilityService() {
     }
 
     private fun saveAnchor(isLeft: Boolean) {
-        val ratioY = params.y.toFloat() / maxOf(1, screenHeight - bubbleSizePx)
+        val ratioY = params.y.toFloat() / maxOf(1, screenHeight - params.height)
         prefs.edit()
             .putFloat("anchor_edge", if (isLeft) 0f else 1f)
             .putFloat("ratio_y", ratioY.coerceIn(0f, 1f))
@@ -277,8 +364,8 @@ class AssistiveTouchService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (::bubble.isInitialized && ::windowManager.isInitialized) {
-            windowManager.removeView(bubble)
+        if (::bubbleContainer.isInitialized && ::windowManager.isInitialized) {
+            windowManager.removeView(bubbleContainer)
         }
     }
 }
