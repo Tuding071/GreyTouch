@@ -104,13 +104,12 @@ jobs:
           package com.grey.touch
 
           import android.accessibilityservice.AccessibilityService
-          import android.view.accessibility.AccessibilityWindowInfo
           import android.annotation.SuppressLint
           import android.content.Context
           import android.content.Intent
           import android.content.SharedPreferences
           import android.content.res.Configuration
-          import android.graphics.Bitmap
+          import android.database.Cursor
           import android.graphics.Color
           import android.graphics.PixelFormat
           import android.graphics.drawable.GradientDrawable
@@ -120,16 +119,18 @@ jobs:
           import android.os.VibrationEffect
           import android.os.Vibrator
           import android.os.VibratorManager
+          import android.provider.MediaStore
           import android.util.Base64
           import android.util.DisplayMetrics
           import android.view.*
           import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityWindowInfo
           import android.webkit.WebView
           import android.webkit.WebViewClient
           import android.widget.FrameLayout
           import android.widget.LinearLayout
           import android.widget.TextView
-          import java.io.ByteArrayOutputStream
+          import java.io.File
           import java.text.SimpleDateFormat
           import java.util.*
           import kotlin.math.abs
@@ -150,6 +151,8 @@ jobs:
               private var screensaverClock: TextView? = null
               private var screensaverAmPm: TextView? = null
               private var screensaverHandler: Handler? = null
+              private var screensaverRunnable: Runnable? = null
+              private var preScreensaverBrightness: Int = -1
               private var lensView: WebView? = null
               private var lensOverlay: FrameLayout? = null
 
@@ -169,7 +172,6 @@ jobs:
               private var pendingTapRunnable: Runnable? = null
 
               private var keyboardVisible = false
-              private var preKeyboardX = 0
               private var preKeyboardY = 0
 
               private val handler = Handler(Looper.getMainLooper())
@@ -185,6 +187,7 @@ jobs:
                   const val DOUBLE_TAP_WINDOW_MS = 200L
                   const val MOVE_THRESHOLD_DP = 50
                   const val SWIPE_THRESHOLD_PX = 60
+                  const val CLOCK_TICK_MS = 60_000L
               }
 
               override fun onServiceConnected() {
@@ -304,7 +307,6 @@ jobs:
                           imeWindow.getBoundsInScreen(bounds)
                           if (!keyboardVisible) {
                               keyboardVisible = true
-                              preKeyboardX = params.x
                               preKeyboardY = params.y
                           }
                           val keyboardTop = bounds.top
@@ -390,19 +392,63 @@ jobs:
                       isClickable = true
                   }
 
-                  val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val row1 = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      )
+                  }
                   row1.addView(menuTile("Screensaver") { hideMenu(); startScreensaver() })
-                  row1.addView(menuTile("Screenshot") { hideMenu(); takeScreenshotAction(saveForLens = false) })
+                  row1.addView(menuTile("Screenshot") { hideMenu(); takeSystemScreenshot(forLens = false) })
 
-                  val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val row2 = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      )
+                  }
                   row2.addView(menuTile("Vol -") { adjustVolume(false) })
                   row2.addView(menuTile("Vol +") { adjustVolume(true) })
 
-                  val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val row3 = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      )
+                  }
                   row3.addView(menuTile("Bright -") { adjustBrightness(false) })
                   row3.addView(menuTile("Bright +") { adjustBrightness(true) })
 
-                  val row4 = menuTile("Screen Search") { hideMenu(); takeScreenshotAction(saveForLens = true) }
+                  // Screen Search: own full-width row, explicit MATCH_PARENT (not weight-based)
+                  val row4 = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      )
+                  }
+                  val searchTile = TextView(this).apply {
+                      text = "Screen Search"
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      gravity = Gravity.CENTER
+                      val padV = (12 * density).toInt()
+                      setPadding(padV, padV, padV, padV)
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.RECTANGLE
+                          cornerRadius = 12 * density
+                          setColor(Color.argb(60, 255, 255, 255))
+                      }
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      )
+                      setOnClickListener { hideMenu(); takeSystemScreenshot(forLens = true) }
+                  }
+                  row4.addView(searchTile)
 
                   card.addView(row1)
                   card.addView(spacer(density))
@@ -477,16 +523,20 @@ jobs:
                   )
               }
 
-              private fun adjustBrightness(up: Boolean) {
-                  try {
-                      val resolver = contentResolver
-                      val current = android.provider.Settings.System.getInt(
-                          resolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, 128
+              private fun getBrightness(): Int {
+                  return try {
+                      android.provider.Settings.System.getInt(
+                          contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, 128
                       )
-                      val step = 25
-                      val newVal = (current + if (up) step else -step).coerceIn(1, 255)
+                  } catch (e: Exception) {
+                      128
+                  }
+              }
+
+              private fun setBrightness(value: Int) {
+                  try {
                       android.provider.Settings.System.putInt(
-                          resolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, newVal
+                          contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, value.coerceIn(1, 255)
                       )
                   } catch (e: SecurityException) {
                       val intent = Intent(android.provider.Settings.ACTION_MANAGE_WRITE_SETTINGS)
@@ -496,50 +546,90 @@ jobs:
                   }
               }
 
-              // ---------- Screenshot / Screen Search ----------
+              private fun adjustBrightness(up: Boolean) {
+                  val current = getBrightness()
+                  val step = 25
+                  setBrightness(current + if (up) step else -step)
+              }
 
-              private fun takeScreenshotAction(saveForLens: Boolean) {
-                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-                      android.widget.Toast.makeText(this, "Screenshot requires Android 11+", android.widget.Toast.LENGTH_SHORT).show()
+              // ---------- Screenshot / Screen Search (system screenshot action) ----------
+
+              private fun takeSystemScreenshot(forLens: Boolean) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                      android.widget.Toast.makeText(this, "Screenshot requires Android 9+", android.widget.Toast.LENGTH_SHORT).show()
                       return
                   }
-                  takeScreenshot(
-                      android.view.Display.DEFAULT_DISPLAY,
-                      mainExecutor,
-                      object : TakeScreenshotCallback {
-                          override fun onSuccess(result: ScreenshotResult) {
-                              val hardwareBitmap = Bitmap.wrapHardwareBuffer(
-                                  result.hardwareBuffer, result.colorSpace
-                              )
-                              val bitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
-                              result.hardwareBuffer.close()
+                  val triggerTime = System.currentTimeMillis()
+                  performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
 
-                              if (bitmap == null) {
-                                  android.widget.Toast.makeText(this@AssistiveTouchService, "Screenshot failed", android.widget.Toast.LENGTH_SHORT).show()
-                                  return
-                              }
+                  if (!forLens) {
+                      android.widget.Toast.makeText(this, "Screenshot captured", android.widget.Toast.LENGTH_SHORT).show()
+                      return
+                  }
 
-                              if (saveForLens) {
-                                  openLensWithBitmap(bitmap)
+                  // give the system a moment to write the file, then locate + read + delete it
+                  handler.postDelayed({
+                      findAndConsumeLatestScreenshot(triggerTime)
+                  }, 900L)
+              }
+
+              private fun findAndConsumeLatestScreenshot(afterTimeMs: Long) {
+                  try {
+                      val projection = arrayOf(
+                          MediaStore.Images.Media._ID,
+                          MediaStore.Images.Media.DATA,
+                          MediaStore.Images.Media.DATE_ADDED
+                      )
+                      val selection = "${MediaStore.Images.Media.DATE_ADDED} >= ?"
+                      val selectionArgs = arrayOf(((afterTimeMs / 1000) - 2).toString())
+                      val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+
+                      val cursor: Cursor? = contentResolver.query(
+                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                          projection, selection, selectionArgs, sortOrder
+                      )
+
+                      cursor?.use {
+                          if (it.moveToFirst()) {
+                              val dataIdx = it.getColumnIndexOrThrow(MediaStore.Images.Media.DATA)
+                              val idIdx = it.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                              val path = it.getString(dataIdx)
+                              val id = it.getLong(idIdx)
+
+                              val file = File(path)
+                              if (file.exists()) {
+                                  val bytes = file.readBytes()
+                                  val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+
+                                  // delete the file immediately, it was only needed temporarily
+                                  try {
+                                      file.delete()
+                                      val deleteUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                                      contentResolver.delete(deleteUri, "${MediaStore.Images.Media._ID}=?", arrayOf(id.toString()))
+                                  } catch (e: Exception) {
+                                  }
+
+                                  handler.post { openLensWithBase64(base64) }
                               } else {
-                                  android.widget.Toast.makeText(this@AssistiveTouchService, "Screenshot captured", android.widget.Toast.LENGTH_SHORT).show()
+                                  handler.post {
+                                      android.widget.Toast.makeText(this, "Could not read screenshot", android.widget.Toast.LENGTH_SHORT).show()
+                                  }
                               }
-                          }
-
-                          override fun onFailure(errorCode: Int) {
-                              android.widget.Toast.makeText(this@AssistiveTouchService, "Screenshot failed", android.widget.Toast.LENGTH_SHORT).show()
+                          } else {
+                              handler.post {
+                                  android.widget.Toast.makeText(this, "Screenshot not found", android.widget.Toast.LENGTH_SHORT).show()
+                              }
                           }
                       }
-                  )
+                  } catch (e: Exception) {
+                      handler.post {
+                          android.widget.Toast.makeText(this, "Screen search failed", android.widget.Toast.LENGTH_SHORT).show()
+                      }
+                  }
               }
 
               @SuppressLint("SetJavaScriptEnabled")
-              private fun openLensWithBitmap(bitmap: Bitmap) {
-                  val outputStream = ByteArrayOutputStream()
-                  bitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
-                  val base64 = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
-                  bitmap.recycle()
-
+              private fun openLensWithBase64(base64: String) {
                   val overlay = FrameLayout(this).apply {
                       setBackgroundColor(Color.BLACK)
                   }
@@ -569,6 +659,7 @@ jobs:
                   val webView = WebView(this).apply {
                       settings.javaScriptEnabled = true
                       settings.domStorageEnabled = true
+                      settings.userAgentString = settings.userAgentString?.replace("; wv", "")
                       webViewClient = object : WebViewClient() {
                           override fun onPageFinished(view: WebView?, url: String?) {
                               super.onPageFinished(view, url)
@@ -636,8 +727,20 @@ jobs:
                   val density = resources.displayMetrics.density
                   val edgeMargin = (24 * density).toInt()
 
+                  // save + force lowest brightness
+                  preScreensaverBrightness = getBrightness()
+                  setBrightness(1)
+
                   val overlay = FrameLayout(this).apply {
                       setBackgroundColor(Color.BLACK)
+                      systemUiVisibility = (
+                          View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                          or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                          or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                          or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                          or View.SYSTEM_UI_FLAG_FULLSCREEN
+                          or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                      )
                   }
 
                   val clockContainer = FrameLayout(this)
@@ -697,24 +800,26 @@ jobs:
                       WindowManager.LayoutParams.MATCH_PARENT,
                       WindowManager.LayoutParams.MATCH_PARENT,
                       WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                          or WindowManager.LayoutParams.FLAG_FULLSCREEN
+                          or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                       PixelFormat.OPAQUE
                   )
                   windowManager.addView(overlay, lp)
 
                   updateScreensaverClock()
+
                   screensaverHandler = Handler(Looper.getMainLooper())
-                  scheduleClockTick()
+                  screensaverRunnable = object : Runnable {
+                      override fun run() {
+                          updateScreensaverClock()
+                          screensaverHandler?.postDelayed(this, CLOCK_TICK_MS)
+                      }
+                  }
+                  screensaverHandler?.postDelayed(screensaverRunnable!!, CLOCK_TICK_MS)
               }
 
               private var clockStopIndex = 0
-              private fun scheduleClockTick() {
-                  screensaverHandler?.postDelayed({
-                      updateScreensaverClock()
-                      scheduleClockTick()
-                  }, 60_000L)
-              }
-
               private fun updateScreensaverClock() {
                   val sdf = SimpleDateFormat("hh:mm", Locale.getDefault())
                   val ampmFmt = SimpleDateFormat("a", Locale.getDefault())
@@ -723,17 +828,18 @@ jobs:
                   screensaverAmPm?.text = ampmFmt.format(now)
 
                   val density = resources.displayMetrics.density
-                  val stops = listOf(-40, 0, 40)
+                  val stops = listOf(-40f, 0f, 40f)
                   val offset = stops[clockStopIndex % stops.size]
                   clockStopIndex++
 
-                  val parent = screensaverClock?.parent?.parent as? LinearLayout
-                  parent?.translationY = offset * density
+                  val wrap = screensaverClock?.parent as? LinearLayout
+                  wrap?.translationY = offset * density
               }
 
               private fun exitScreensaver() {
-                  screensaverHandler?.removeCallbacksAndMessages(null)
+                  screensaverRunnable?.let { screensaverHandler?.removeCallbacks(it) }
                   screensaverHandler = null
+                  screensaverRunnable = null
                   screensaverView?.let {
                       try { windowManager.removeView(it) } catch (e: Exception) {}
                   }
@@ -741,6 +847,11 @@ jobs:
                   screensaverClock = null
                   screensaverAmPm = null
                   clockStopIndex = 0
+
+                  if (preScreensaverBrightness >= 0) {
+                      setBrightness(preScreensaverBrightness)
+                      preScreensaverBrightness = -1
+                  }
               }
 
               // ---------- Gesture handling ----------
@@ -788,13 +899,11 @@ jobs:
                               snapToNearestEdge()
                           } else if (!moved && elapsed < TAP_MAX_MS) {
                               if (pendingTapRunnable != null) {
-                                  // second tap arrived within window -> double tap -> lock
                                   handler.removeCallbacks(pendingTapRunnable!!)
                                   pendingTapRunnable = null
                                   vibrate(45)
                                   lockPhone()
                               } else {
-                                  // first tap -> wait to see if a second tap comes
                                   val runnable = Runnable {
                                       vibrate()
                                       performGlobalAction(GLOBAL_ACTION_BACK)
@@ -875,6 +984,8 @@ jobs:
               <uses-permission android:name="android.permission.VIBRATE" />
               <uses-permission android:name="android.permission.WRITE_SETTINGS" />
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
               <application
                   android:allowBackup="true"
@@ -966,7 +1077,7 @@ jobs:
 
               defaultConfig {
                   applicationId = "com.grey.touch"
-                  minSdk = 30
+                  minSdk = 28
                   targetSdk = 34
                   versionCode = (project.findProperty("BUILD_NUMBER") as String? ?: "1").toInt()
                   versionName = "1.0.${project.findProperty("BUILD_NUMBER") as String? ?: "1"}"
