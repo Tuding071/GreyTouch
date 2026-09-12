@@ -28,7 +28,10 @@ jobs:
           cat > app/src/main/java/com/grey/touch/MainActivity.kt << 'KOTLIN_EOF'
           package com.grey.touch
 
+          import android.Manifest
           import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
           import android.text.TextUtils
@@ -40,10 +43,14 @@ jobs:
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.unit.dp
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
 
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  requestStoragePermissionIfNeeded()
+
                   setContent {
                       MaterialTheme {
                           Surface(modifier = Modifier.fillMaxSize()) {
@@ -60,7 +67,7 @@ jobs:
                                   )
                                   Spacer(modifier = Modifier.height(16.dp))
                                   Text(
-                                      text = "This app needs Accessibility permission to show the floating bubble and control back/recents.",
+                                      text = "This app needs Accessibility permission to show the floating bubble and control back/recents. Storage access is used briefly for Screen Search.",
                                       style = MaterialTheme.typography.bodyMedium
                                   )
                                   Spacer(modifier = Modifier.height(24.dp))
@@ -82,6 +89,17 @@ jobs:
               override fun onResume() {
                   super.onResume()
                   recreate()
+              }
+
+              private fun requestStoragePermissionIfNeeded() {
+                  val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      Manifest.permission.READ_MEDIA_IMAGES
+                  } else {
+                      Manifest.permission.READ_EXTERNAL_STORAGE
+                  }
+                  if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+                      ActivityCompat.requestPermissions(this, arrayOf(permission), 1001)
+                  }
               }
 
               private fun isServiceEnabled(): Boolean {
@@ -112,6 +130,7 @@ jobs:
           import android.database.Cursor
           import android.graphics.Color
           import android.graphics.PixelFormat
+          import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
           import android.os.Build
           import android.os.Handler
@@ -130,6 +149,8 @@ jobs:
           import android.widget.FrameLayout
           import android.widget.LinearLayout
           import android.widget.TextView
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsControllerCompat
           import java.io.File
           import java.text.SimpleDateFormat
           import java.util.*
@@ -422,7 +443,6 @@ jobs:
                   row3.addView(menuTile("Bright -") { adjustBrightness(false) })
                   row3.addView(menuTile("Bright +") { adjustBrightness(true) })
 
-                  // Screen Search: own full-width row, explicit MATCH_PARENT (not weight-based)
                   val row4 = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       layoutParams = LinearLayout.LayoutParams(
@@ -567,7 +587,6 @@ jobs:
                       return
                   }
 
-                  // give the system a moment to write the file, then locate + read + delete it
                   handler.postDelayed({
                       findAndConsumeLatestScreenshot(triggerTime)
                   }, 900L)
@@ -601,11 +620,12 @@ jobs:
                                   val bytes = file.readBytes()
                                   val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
 
-                                  // delete the file immediately, it was only needed temporarily
                                   try {
                                       file.delete()
-                                      val deleteUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                                      contentResolver.delete(deleteUri, "${MediaStore.Images.Media._ID}=?", arrayOf(id.toString()))
+                                      contentResolver.delete(
+                                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                                          "${MediaStore.Images.Media._ID}=?", arrayOf(id.toString())
+                                      )
                                   } catch (e: Exception) {
                                   }
 
@@ -617,9 +637,15 @@ jobs:
                               }
                           } else {
                               handler.post {
-                                  android.widget.Toast.makeText(this, "Screenshot not found", android.widget.Toast.LENGTH_SHORT).show()
+                                  android.widget.Toast.makeText(this, "Screenshot not found (check storage permission)", android.widget.Toast.LENGTH_LONG).show()
                               }
                           }
+                      } ?: handler.post {
+                          android.widget.Toast.makeText(this, "Storage permission needed — open the app once to grant it", android.widget.Toast.LENGTH_LONG).show()
+                      }
+                  } catch (e: SecurityException) {
+                      handler.post {
+                          android.widget.Toast.makeText(this, "Storage permission needed — open the app once to grant it", android.widget.Toast.LENGTH_LONG).show()
                       }
                   } catch (e: Exception) {
                       handler.post {
@@ -727,32 +753,25 @@ jobs:
                   val density = resources.displayMetrics.density
                   val edgeMargin = (24 * density).toInt()
 
-                  // save + force lowest brightness
                   preScreensaverBrightness = getBrightness()
                   setBrightness(1)
 
                   val overlay = FrameLayout(this).apply {
                       setBackgroundColor(Color.BLACK)
-                      systemUiVisibility = (
-                          View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                          or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                          or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                          or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                          or View.SYSTEM_UI_FLAG_FULLSCREEN
-                          or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                      )
                   }
 
                   val clockContainer = FrameLayout(this)
 
                   val clock = TextView(this).apply {
-                      textSize = 34f
-                      setTextColor(Color.argb(140, 255, 255, 255))
+                      textSize = 52f
+                      setTypeface(typeface, Typeface.BOLD)
+                      setTextColor(Color.argb(150, 255, 255, 255))
                       gravity = Gravity.CENTER
                   }
                   val ampm = TextView(this).apply {
-                      textSize = 12f
-                      setTextColor(Color.argb(90, 255, 255, 255))
+                      textSize = 14f
+                      setTypeface(typeface, Typeface.BOLD)
+                      setTextColor(Color.argb(100, 255, 255, 255))
                       gravity = Gravity.CENTER
                   }
 
@@ -801,38 +820,69 @@ jobs:
                       WindowManager.LayoutParams.MATCH_PARENT,
                       WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                       WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                          or WindowManager.LayoutParams.FLAG_FULLSCREEN
                           or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                       PixelFormat.OPAQUE
                   )
                   windowManager.addView(overlay, lp)
+
+                  try {
+                      val insetsController = WindowCompat.getInsetsController(lp, overlay)
+                      WindowCompat.setDecorFitsSystemWindows(windowManager as android.view.Window? ?: return@let, false)
+                  } catch (e: Exception) {
+                  }
+
+                  applySystemBarsHidden(overlay)
 
                   updateScreensaverClock()
 
                   screensaverHandler = Handler(Looper.getMainLooper())
                   screensaverRunnable = object : Runnable {
                       override fun run() {
-                          updateScreensaverClock()
-                          screensaverHandler?.postDelayed(this, CLOCK_TICK_MS)
+                          try {
+                              updateScreensaverClock()
+                          } catch (e: Exception) {
+                          } finally {
+                              screensaverHandler?.postDelayed(this, CLOCK_TICK_MS)
+                          }
                       }
                   }
                   screensaverHandler?.postDelayed(screensaverRunnable!!, CLOCK_TICK_MS)
               }
 
+              private fun applySystemBarsHidden(overlay: View) {
+                  try {
+                      val controller = WindowInsetsControllerCompat(windowManager as? android.view.Window ?: return, overlay)
+                  } catch (e: Exception) {
+                  }
+                  // fallback: legacy flags, still needed since we don't have a real Window/Activity here
+                  @Suppress("DEPRECATION")
+                  overlay.systemUiVisibility = (
+                      View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                      or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                      or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                      or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                      or View.SYSTEM_UI_FLAG_FULLSCREEN
+                      or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                  )
+              }
+
               private var clockStopIndex = 0
               private fun updateScreensaverClock() {
+                  val clockRef = screensaverClock ?: return
+                  val ampmRef = screensaverAmPm ?: return
+
                   val sdf = SimpleDateFormat("hh:mm", Locale.getDefault())
                   val ampmFmt = SimpleDateFormat("a", Locale.getDefault())
                   val now = Date()
-                  screensaverClock?.text = sdf.format(now)
-                  screensaverAmPm?.text = ampmFmt.format(now)
+                  clockRef.text = sdf.format(now)
+                  ampmRef.text = ampmFmt.format(now)
 
                   val density = resources.displayMetrics.density
                   val stops = listOf(-40f, 0f, 40f)
                   val offset = stops[clockStopIndex % stops.size]
                   clockStopIndex++
 
-                  val wrap = screensaverClock?.parent as? LinearLayout
+                  val wrap = clockRef.parent as? LinearLayout
                   wrap?.translationY = offset * density
               }
 
