@@ -118,11 +118,27 @@ jobs:
           }
           KOTLIN_EOF
 
+          cat > app/src/main/java/com/grey/touch/ClockTickReceiver.kt << 'KOTLIN_EOF'
+          package com.grey.touch
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class ClockTickReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context?, intent: Intent?) {
+                  AssistiveTouchService.instance?.onClockTickAlarm()
+              }
+          }
+          KOTLIN_EOF
+
           cat > app/src/main/java/com/grey/touch/AssistiveTouchService.kt << 'KOTLIN_EOF'
           package com.grey.touch
 
           import android.accessibilityservice.AccessibilityService
           import android.annotation.SuppressLint
+          import android.app.AlarmManager
+          import android.app.PendingIntent
           import android.content.Context
           import android.content.Intent
           import android.content.SharedPreferences
@@ -135,6 +151,7 @@ jobs:
           import android.os.Build
           import android.os.Handler
           import android.os.Looper
+          import android.os.SystemClock
           import android.os.VibrationEffect
           import android.os.Vibrator
           import android.os.VibratorManager
@@ -156,6 +173,19 @@ jobs:
 
           class AssistiveTouchService : AccessibilityService() {
 
+              companion object {
+                  const val TAP_MAX_MS = 200L
+                  const val HOLD_MIN_MS = 210L
+                  const val DOUBLE_TAP_WINDOW_MS = 200L
+                  const val MOVE_THRESHOLD_DP = 50
+                  const val SWIPE_THRESHOLD_PX = 60
+                  const val CLOCK_TICK_MS = 60_000L
+                  const val REPEAT_INTERVAL_MS = 180L
+                  const val CLOCK_ALARM_REQUEST_CODE = 4201
+
+                  var instance: AssistiveTouchService? = null
+              }
+
               private lateinit var windowManager: WindowManager
               private lateinit var bubbleContainer: FrameLayout
               private lateinit var ringOuter: View
@@ -169,8 +199,6 @@ jobs:
               private var screensaverView: FrameLayout? = null
               private var screensaverClock: TextView? = null
               private var screensaverAmPm: TextView? = null
-              private var screensaverHandler: Handler? = null
-              private var screensaverRunnable: Runnable? = null
               private var preScreensaverBrightness: Int = -1
               private var lensView: WebView? = null
               private var lensOverlay: FrameLayout? = null
@@ -200,17 +228,17 @@ jobs:
                   vibrate()
               }
 
-              companion object {
-                  const val TAP_MAX_MS = 200L
-                  const val HOLD_MIN_MS = 210L
-                  const val DOUBLE_TAP_WINDOW_MS = 200L
-                  const val MOVE_THRESHOLD_DP = 50
-                  const val SWIPE_THRESHOLD_PX = 60
-                  const val CLOCK_TICK_MS = 60_000L
+              private var repeatHandler: Handler? = null
+              private var repeatRunnable: Runnable? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
               }
 
               override fun onServiceConnected() {
                   super.onServiceConnected()
+                  instance = this
                   prefs = getSharedPreferences("assistive_touch_prefs", Context.MODE_PRIVATE)
                   windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
@@ -428,8 +456,8 @@ jobs:
                           LinearLayout.LayoutParams.WRAP_CONTENT
                       )
                   }
-                  row2.addView(menuTile("Vol -") { adjustVolume(false) })
-                  row2.addView(menuTile("Vol +") { adjustVolume(true) })
+                  row2.addView(repeatableMenuTile("Vol -") { adjustVolume(false) })
+                  row2.addView(repeatableMenuTile("Vol +") { adjustVolume(true) })
 
                   val row3 = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
@@ -438,8 +466,8 @@ jobs:
                           LinearLayout.LayoutParams.WRAP_CONTENT
                       )
                   }
-                  row3.addView(menuTile("Bright -") { adjustBrightness(false) })
-                  row3.addView(menuTile("Bright +") { adjustBrightness(true) })
+                  row3.addView(repeatableMenuTile("Bright -") { adjustBrightness(false) })
+                  row3.addView(repeatableMenuTile("Bright +") { adjustBrightness(true) })
 
                   val row4 = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
@@ -491,6 +519,7 @@ jobs:
               }
 
               private fun hideMenu() {
+                  stopRepeat()
                   menuView?.let {
                       try { windowManager.removeView(it) } catch (e: Exception) {}
                   }
@@ -532,6 +561,67 @@ jobs:
                   }
               }
 
+              // Hold-to-repeat tile: fires once immediately, then repeats every REPEAT_INTERVAL_MS while held
+              @SuppressLint("ClickableViewAccessibility")
+              private fun repeatableMenuTile(label: String, action: () -> Unit): View {
+                  val density = resources.displayMetrics.density
+                  return TextView(this).apply {
+                      text = label
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      gravity = Gravity.CENTER
+                      val padV = (12 * density).toInt()
+                      setPadding(padV, padV, padV, padV)
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.RECTANGLE
+                          cornerRadius = 12 * density
+                          setColor(Color.argb(60, 255, 255, 255))
+                      }
+                      layoutParams = LinearLayout.LayoutParams(
+                          0,
+                          LinearLayout.LayoutParams.WRAP_CONTENT,
+                          1f
+                      ).apply {
+                          val m = (4 * density).toInt()
+                          setMargins(m, 0, m, 0)
+                      }
+                      setOnTouchListener { _, event ->
+                          when (event.action) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  startRepeat(action)
+                                  true
+                              }
+                              MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                  stopRepeat()
+                                  true
+                              }
+                              else -> false
+                          }
+                      }
+                  }
+              }
+
+              private fun startRepeat(action: () -> Unit) {
+                  stopRepeat()
+                  action()
+                  val h = Handler(Looper.getMainLooper())
+                  repeatHandler = h
+                  val r = object : Runnable {
+                      override fun run() {
+                          action()
+                          h.postDelayed(this, REPEAT_INTERVAL_MS)
+                      }
+                  }
+                  repeatRunnable = r
+                  h.postDelayed(r, REPEAT_INTERVAL_MS)
+              }
+
+              private fun stopRepeat() {
+                  repeatRunnable?.let { repeatHandler?.removeCallbacks(it) }
+                  repeatRunnable = null
+                  repeatHandler = null
+              }
+
               private fun adjustVolume(up: Boolean) {
                   val audioManager = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
                   audioManager.adjustStreamVolume(
@@ -566,7 +656,7 @@ jobs:
 
               private fun adjustBrightness(up: Boolean) {
                   val current = getBrightness()
-                  val step = 25
+                  val step = 8
                   setBrightness(current + if (up) step else -step)
               }
 
@@ -744,7 +834,7 @@ jobs:
                   lensOverlay = null
               }
 
-              // ---------- Screensaver ----------
+              // ---------- Screensaver (clock tick now driven by AlarmManager, not Handler) ----------
 
               private fun startScreensaver() {
                   if (screensaverView != null) return
@@ -795,10 +885,12 @@ jobs:
                   screensaverAmPm = ampm
 
                   var touchStartY = 0f
+                  var touchStartX = 0f
                   overlay.setOnTouchListener { _, event ->
                       when (event.action) {
                           MotionEvent.ACTION_DOWN -> {
                               touchStartY = event.y
+                              touchStartX = event.x
                               val safeTop = edgeMargin * 2
                               val safeBottom = screenHeight - edgeMargin * 2
                               if (event.y < safeTop || event.y > safeBottom) return@setOnTouchListener true
@@ -829,19 +921,7 @@ jobs:
                   }
 
                   updateScreensaverClock()
-
-                  screensaverHandler = Handler(Looper.getMainLooper())
-                  screensaverRunnable = object : Runnable {
-                      override fun run() {
-                          try {
-                              updateScreensaverClock()
-                          } catch (e: Exception) {
-                          } finally {
-                              screensaverHandler?.postDelayed(this, CLOCK_TICK_MS)
-                          }
-                      }
-                  }
-                  screensaverHandler?.postDelayed(screensaverRunnable!!, CLOCK_TICK_MS)
+                  scheduleClockAlarm()
               }
 
               @Suppress("DEPRECATION")
@@ -854,6 +934,39 @@ jobs:
                       or View.SYSTEM_UI_FLAG_FULLSCREEN
                       or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                   )
+              }
+
+              // Called by ClockTickReceiver when the AlarmManager alarm fires
+              fun onClockTickAlarm() {
+                  if (screensaverView == null) return
+                  updateScreensaverClock()
+                  scheduleClockAlarm()
+              }
+
+              private fun scheduleClockAlarm() {
+                  val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val intent = Intent(this, ClockTickReceiver::class.java)
+                  val pendingIntent = PendingIntent.getBroadcast(
+                      this, CLOCK_ALARM_REQUEST_CODE, intent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val triggerAt = SystemClock.elapsedRealtime() + CLOCK_TICK_MS
+                  try {
+                      alarmManager.setExactAndAllowWhileIdle(
+                          AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent
+                      )
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun cancelClockAlarm() {
+                  val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val intent = Intent(this, ClockTickReceiver::class.java)
+                  val pendingIntent = PendingIntent.getBroadcast(
+                      this, CLOCK_ALARM_REQUEST_CODE, intent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+                  try { alarmManager.cancel(pendingIntent) } catch (e: Exception) {}
               }
 
               private var clockStopIndex = 0
@@ -877,9 +990,7 @@ jobs:
               }
 
               private fun exitScreensaver() {
-                  screensaverRunnable?.let { screensaverHandler?.removeCallbacks(it) }
-                  screensaverHandler = null
-                  screensaverRunnable = null
+                  cancelClockAlarm()
                   screensaverView?.let {
                       try { windowManager.removeView(it) } catch (e: Exception) {}
                   }
@@ -953,11 +1064,15 @@ jobs:
                                   handler.postDelayed(runnable, DOUBLE_TAP_WINDOW_MS)
                               }
                           } else {
-                              val swipedUp = dy < -SWIPE_THRESHOLD_PX && abs(dy) > abs(dx)
-                              val swipedDown = dy > SWIPE_THRESHOLD_PX && abs(dy) > abs(dx)
+                              val absDx = abs(dx)
+                              val absDy = abs(dy)
+                              val swipedUp = dy < -SWIPE_THRESHOLD_PX && absDy > absDx
+                              val swipedDown = dy > SWIPE_THRESHOLD_PX && absDy > absDx
+                              val swipedHorizontal = absDx > SWIPE_THRESHOLD_PX && absDx > absDy
                               when {
                                   swipedUp -> performGlobalAction(GLOBAL_ACTION_RECENTS)
                                   swipedDown -> showMenu()
+                                  swipedHorizontal -> performGlobalAction(GLOBAL_ACTION_HOME)
                               }
                           }
                           isDragging = false
@@ -1007,6 +1122,7 @@ jobs:
 
               override fun onDestroy() {
                   super.onDestroy()
+                  instance = null
                   hideMenu()
                   exitScreensaver()
                   closeLens()
@@ -1026,6 +1142,8 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
               <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
               <application
                   android:allowBackup="true"
@@ -1041,6 +1159,10 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <receiver
+                      android:name=".ClockTickReceiver"
+                      android:exported="false" />
 
                   <service
                       android:name=".AssistiveTouchService"
