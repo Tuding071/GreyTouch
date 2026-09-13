@@ -49,7 +49,7 @@ jobs:
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  requestStoragePermissionIfNeeded()
+                  requestNotificationPermissionIfNeeded()
 
                   setContent {
                       MaterialTheme {
@@ -67,7 +67,7 @@ jobs:
                                   )
                                   Spacer(modifier = Modifier.height(16.dp))
                                   Text(
-                                      text = "This app needs Accessibility permission to show the floating bubble and control back/recents. Storage access is used briefly for Screen Search.",
+                                      text = "This app needs Accessibility permission to show the floating bubble and control back/recents.",
                                       style = MaterialTheme.typography.bodyMedium
                                   )
                                   Spacer(modifier = Modifier.height(24.dp))
@@ -91,14 +91,11 @@ jobs:
                   recreate()
               }
 
-              private fun requestStoragePermissionIfNeeded() {
-                  val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                      Manifest.permission.READ_MEDIA_IMAGES
-                  } else {
-                      Manifest.permission.READ_EXTERNAL_STORAGE
-                  }
-                  if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
-                      ActivityCompat.requestPermissions(this, arrayOf(permission), 1001)
+              private fun requestNotificationPermissionIfNeeded() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                          ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1002)
+                      }
                   }
               }
 
@@ -132,22 +129,64 @@ jobs:
           }
           KOTLIN_EOF
 
+          cat > app/src/main/java/com/grey/touch/ScreenCaptureRequestActivity.kt << 'KOTLIN_EOF'
+          package com.grey.touch
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.os.Bundle
+
+          class ScreenCaptureRequestActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  try {
+                      startActivityForResult(mgr.createScreenCaptureIntent(), REQUEST_CODE)
+                  } catch (e: Exception) {
+                      AssistiveTouchService.instance?.onScreenCapturePermissionResult(Activity.RESULT_CANCELED, null)
+                      finish()
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  AssistiveTouchService.instance?.onScreenCapturePermissionResult(resultCode, data)
+                  finish()
+              }
+
+              companion object {
+                  const val REQUEST_CODE = 9001
+              }
+          }
+          KOTLIN_EOF
+
           cat > app/src/main/java/com/grey/touch/AssistiveTouchService.kt << 'KOTLIN_EOF'
           package com.grey.touch
 
           import android.accessibilityservice.AccessibilityService
           import android.annotation.SuppressLint
+          import android.app.Activity
           import android.app.AlarmManager
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
           import android.app.PendingIntent
           import android.content.Context
           import android.content.Intent
           import android.content.SharedPreferences
+          import android.content.pm.ServiceInfo
           import android.content.res.Configuration
-          import android.database.Cursor
+          import android.graphics.Bitmap
           import android.graphics.Color
           import android.graphics.PixelFormat
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
           import android.os.Build
           import android.os.Handler
           import android.os.Looper
@@ -155,7 +194,6 @@ jobs:
           import android.os.VibrationEffect
           import android.os.Vibrator
           import android.os.VibratorManager
-          import android.provider.MediaStore
           import android.util.Base64
           import android.util.DisplayMetrics
           import android.view.*
@@ -166,7 +204,8 @@ jobs:
           import android.widget.FrameLayout
           import android.widget.LinearLayout
           import android.widget.TextView
-          import java.io.File
+          import androidx.core.app.NotificationCompat
+          import java.io.ByteArrayOutputStream
           import java.text.SimpleDateFormat
           import java.util.*
           import kotlin.math.abs
@@ -179,9 +218,10 @@ jobs:
                   const val DOUBLE_TAP_WINDOW_MS = 200L
                   const val MOVE_THRESHOLD_DP = 50
                   const val SWIPE_THRESHOLD_PX = 60
-                  const val CLOCK_TICK_MS = 60_000L
                   const val REPEAT_INTERVAL_MS = 180L
                   const val CLOCK_ALARM_REQUEST_CODE = 4201
+                  const val CAPTURE_NOTIFICATION_ID = 9002
+                  const val CAPTURE_CHANNEL_ID = "screen_search_channel"
 
                   var instance: AssistiveTouchService? = null
               }
@@ -231,6 +271,15 @@ jobs:
               private var repeatHandler: Handler? = null
               private var repeatRunnable: Runnable? = null
 
+              private var screensaverHandler: Handler? = null
+              private var screensaverRunnable: Runnable? = null
+              private var lastClockUpdateElapsed = 0L
+              private var clockStopIndex = 0
+
+              private var mediaProjectionManager: MediaProjectionManager? = null
+              private var mediaProjection: MediaProjection? = null
+              private var pendingCaptureCallback: ((Bitmap) -> Unit)? = null
+
               override fun onCreate() {
                   super.onCreate()
                   instance = this
@@ -241,6 +290,7 @@ jobs:
                   instance = this
                   prefs = getSharedPreferences("assistive_touch_prefs", Context.MODE_PRIVATE)
                   windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
                   vibrator = try {
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -447,7 +497,7 @@ jobs:
                       )
                   }
                   row1.addView(menuTile("Screensaver") { hideMenu(); startScreensaver() })
-                  row1.addView(menuTile("Screenshot") { hideMenu(); takeSystemScreenshot(forLens = false) })
+                  row1.addView(menuTile("Screenshot") { hideMenu(); takeSystemScreenshot() })
 
                   val row2 = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
@@ -492,7 +542,7 @@ jobs:
                           LinearLayout.LayoutParams.MATCH_PARENT,
                           LinearLayout.LayoutParams.WRAP_CONTENT
                       )
-                      setOnClickListener { hideMenu(); takeSystemScreenshot(forLens = true) }
+                      setOnClickListener { hideMenu(); startScreenSearch() }
                   }
                   row4.addView(searchTile)
 
@@ -561,7 +611,6 @@ jobs:
                   }
               }
 
-              // Hold-to-repeat tile: fires once immediately, then repeats every REPEAT_INTERVAL_MS while held
               @SuppressLint("ClickableViewAccessibility")
               private fun repeatableMenuTile(label: String, action: () -> Unit): View {
                   val density = resources.displayMetrics.density
@@ -660,85 +709,169 @@ jobs:
                   setBrightness(current + if (up) step else -step)
               }
 
-              // ---------- Screenshot / Screen Search (system screenshot action) ----------
+              // ---------- Plain screenshot ----------
 
-              private fun takeSystemScreenshot(forLens: Boolean) {
+              private fun takeSystemScreenshot() {
                   if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
                       android.widget.Toast.makeText(this, "Screenshot requires Android 9+", android.widget.Toast.LENGTH_SHORT).show()
                       return
                   }
-                  val triggerTime = System.currentTimeMillis()
                   performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
+                  android.widget.Toast.makeText(this, "Screenshot captured", android.widget.Toast.LENGTH_SHORT).show()
+              }
 
-                  if (!forLens) {
-                      android.widget.Toast.makeText(this, "Screenshot captured", android.widget.Toast.LENGTH_SHORT).show()
+              // ---------- Screen Search via MediaProjection ----------
+
+              private fun startScreenSearch() {
+                  pendingCaptureCallback = { bitmap ->
+                      val stream = ByteArrayOutputStream()
+                      bitmap.compress(Bitmap.CompressFormat.JPEG, 90, stream)
+                      val base64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+                      bitmap.recycle()
+                      openLensWithBase64(base64)
+                  }
+                  val intent = Intent(this, ScreenCaptureRequestActivity::class.java).apply {
+                      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  }
+                  startActivity(intent)
+              }
+
+              fun onScreenCapturePermissionResult(resultCode: Int, data: Intent?) {
+                  if (resultCode != Activity.RESULT_OK || data == null) {
+                      pendingCaptureCallback = null
+                      handler.post {
+                          android.widget.Toast.makeText(this, "Screen capture permission denied", android.widget.Toast.LENGTH_SHORT).show()
+                      }
                       return
                   }
 
-                  handler.postDelayed({
-                      findAndConsumeLatestScreenshot(triggerTime)
-                  }, 900L)
+                  try {
+                      startForegroundForCapture()
+                      val mgr = mediaProjectionManager ?: return
+                      val projection = mgr.getMediaProjection(resultCode, data)
+                      mediaProjection = projection
+                      projection.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() {
+                              super.onStop()
+                          }
+                      }, handler)
+                      performCapture(projection)
+                  } catch (e: Exception) {
+                      pendingCaptureCallback = null
+                      stopForegroundCapture()
+                      handler.post {
+                          android.widget.Toast.makeText(this, "Screen capture failed to start", android.widget.Toast.LENGTH_SHORT).show()
+                      }
+                  }
               }
 
-              private fun findAndConsumeLatestScreenshot(afterTimeMs: Long) {
+              private fun startForegroundForCapture() {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  val channel = NotificationChannel(
+                      CAPTURE_CHANNEL_ID, "Screen Search", NotificationManager.IMPORTANCE_LOW
+                  )
+                  nm.createNotificationChannel(channel)
+
+                  val notification = NotificationCompat.Builder(this, CAPTURE_CHANNEL_ID)
+                      .setContentTitle("Capturing screen for search")
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setOngoing(true)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      startForeground(CAPTURE_NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else {
+                      startForeground(CAPTURE_NOTIFICATION_ID, notification)
+                  }
+              }
+
+              private fun stopForegroundCapture() {
                   try {
-                      val projection = arrayOf(
-                          MediaStore.Images.Media._ID,
-                          MediaStore.Images.Media.DATA,
-                          MediaStore.Images.Media.DATE_ADDED
-                      )
-                      val selection = "${MediaStore.Images.Media.DATE_ADDED} >= ?"
-                      val selectionArgs = arrayOf(((afterTimeMs / 1000) - 2).toString())
-                      val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
-
-                      val cursor: Cursor? = contentResolver.query(
-                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                          projection, selection, selectionArgs, sortOrder
-                      )
-
-                      cursor?.use {
-                          if (it.moveToFirst()) {
-                              val dataIdx = it.getColumnIndexOrThrow(MediaStore.Images.Media.DATA)
-                              val idIdx = it.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-                              val path = it.getString(dataIdx)
-                              val id = it.getLong(idIdx)
-
-                              val file = File(path)
-                              if (file.exists()) {
-                                  val bytes = file.readBytes()
-                                  val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-
-                                  try {
-                                      file.delete()
-                                      contentResolver.delete(
-                                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                                          "${MediaStore.Images.Media._ID}=?", arrayOf(id.toString())
-                                      )
-                                  } catch (e: Exception) {
-                                  }
-
-                                  handler.post { openLensWithBase64(base64) }
-                              } else {
-                                  handler.post {
-                                      android.widget.Toast.makeText(this, "Could not read screenshot", android.widget.Toast.LENGTH_SHORT).show()
-                                  }
-                              }
-                          } else {
-                              handler.post {
-                                  android.widget.Toast.makeText(this, "Screenshot not found (check storage permission)", android.widget.Toast.LENGTH_LONG).show()
-                              }
-                          }
-                      } ?: handler.post {
-                          android.widget.Toast.makeText(this, "Storage permission needed — open the app once to grant it", android.widget.Toast.LENGTH_LONG).show()
-                      }
-                  } catch (e: SecurityException) {
-                      handler.post {
-                          android.widget.Toast.makeText(this, "Storage permission needed — open the app once to grant it", android.widget.Toast.LENGTH_LONG).show()
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                          stopForeground(STOP_FOREGROUND_REMOVE)
+                      } else {
+                          @Suppress("DEPRECATION")
+                          stopForeground(true)
                       }
                   } catch (e: Exception) {
-                      handler.post {
-                          android.widget.Toast.makeText(this, "Screen search failed", android.widget.Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun performCapture(projection: MediaProjection) {
+                  val metrics = resources.displayMetrics
+                  val width = metrics.widthPixels
+                  val height = metrics.heightPixels
+                  val density = metrics.densityDpi
+
+                  val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+
+                  var virtualDisplay: VirtualDisplay? = null
+                  virtualDisplay = projection.createVirtualDisplay(
+                      "ScreenSearchCapture",
+                      width, height, density,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      imageReader.surface, null, handler
+                  )
+
+                  var handled = false
+                  imageReader.setOnImageAvailableListener({ reader ->
+                      if (handled) return@setOnImageAvailableListener
+                      val image = try { reader.acquireLatestImage() } catch (e: Exception) { null }
+                      if (image != null) {
+                          handled = true
+                          val bitmap = imageToBitmap(image, width, height)
+                          try { image.close() } catch (e: Exception) {}
+                          try { virtualDisplay?.release() } catch (e: Exception) {}
+                          try { imageReader.close() } catch (e: Exception) {}
+                          try { projection.stop() } catch (e: Exception) {}
+                          mediaProjection = null
+                          stopForegroundCapture()
+
+                          val cb = pendingCaptureCallback
+                          pendingCaptureCallback = null
+                          if (bitmap != null && cb != null) {
+                              handler.post { cb(bitmap) }
+                          } else {
+                              handler.post {
+                                  android.widget.Toast.makeText(this, "Screen capture failed", android.widget.Toast.LENGTH_SHORT).show()
+                              }
+                          }
                       }
+                  }, handler)
+
+                  handler.postDelayed({
+                      if (!handled) {
+                          handled = true
+                          try { virtualDisplay?.release() } catch (e: Exception) {}
+                          try { imageReader.close() } catch (e: Exception) {}
+                          try { projection.stop() } catch (e: Exception) {}
+                          mediaProjection = null
+                          stopForegroundCapture()
+                          pendingCaptureCallback = null
+                          android.widget.Toast.makeText(this, "Screen capture timed out", android.widget.Toast.LENGTH_SHORT).show()
+                      }
+                  }, 4000L)
+              }
+
+              private fun imageToBitmap(image: Image, width: Int, height: Int): Bitmap? {
+                  return try {
+                      val plane = image.planes[0]
+                      val buffer = plane.buffer
+                      val pixelStride = plane.pixelStride
+                      val rowStride = plane.rowStride
+                      val rowPadding = rowStride - pixelStride * width
+                      val paddedWidth = width + rowPadding / pixelStride
+                      val bitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
+                      bitmap.copyPixelsFromBuffer(buffer)
+                      if (paddedWidth == width) {
+                          bitmap
+                      } else {
+                          val cropped = Bitmap.createBitmap(bitmap, 0, 0, width, height)
+                          bitmap.recycle()
+                          cropped
+                      }
+                  } catch (e: Exception) {
+                      null
                   }
               }
 
@@ -834,7 +967,13 @@ jobs:
                   lensOverlay = null
               }
 
-              // ---------- Screensaver (clock tick now driven by AlarmManager, not Handler) ----------
+              // ---------- Screensaver ----------
+
+              private fun msUntilNextMinuteBoundary(): Long {
+                  val now = System.currentTimeMillis()
+                  val remainder = now % 60_000L
+                  return 60_000L - remainder
+              }
 
               private fun startScreensaver() {
                   if (screensaverView != null) return
@@ -883,14 +1022,14 @@ jobs:
                   screensaverView = overlay
                   screensaverClock = clock
                   screensaverAmPm = ampm
+                  lastClockUpdateElapsed = 0L
+                  clockStopIndex = 0
 
                   var touchStartY = 0f
-                  var touchStartX = 0f
                   overlay.setOnTouchListener { _, event ->
                       when (event.action) {
                           MotionEvent.ACTION_DOWN -> {
                               touchStartY = event.y
-                              touchStartX = event.x
                               val safeTop = edgeMargin * 2
                               val safeBottom = screenHeight - edgeMargin * 2
                               if (event.y < safeTop || event.y > safeBottom) return@setOnTouchListener true
@@ -921,6 +1060,16 @@ jobs:
                   }
 
                   updateScreensaverClock()
+
+                  screensaverHandler = Handler(Looper.getMainLooper())
+                  screensaverRunnable = object : Runnable {
+                      override fun run() {
+                          try { updateScreensaverClock() } catch (e: Exception) {}
+                          screensaverHandler?.postDelayed(this, msUntilNextMinuteBoundary())
+                      }
+                  }
+                  screensaverHandler?.postDelayed(screensaverRunnable!!, msUntilNextMinuteBoundary())
+
                   scheduleClockAlarm()
               }
 
@@ -936,7 +1085,6 @@ jobs:
                   )
               }
 
-              // Called by ClockTickReceiver when the AlarmManager alarm fires
               fun onClockTickAlarm() {
                   if (screensaverView == null) return
                   updateScreensaverClock()
@@ -950,11 +1098,10 @@ jobs:
                       this, CLOCK_ALARM_REQUEST_CODE, intent,
                       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                   )
-                  val triggerAt = SystemClock.elapsedRealtime() + CLOCK_TICK_MS
+                  val delay = msUntilNextMinuteBoundary()
+                  val triggerAt = SystemClock.elapsedRealtime() + delay
                   try {
-                      alarmManager.setExactAndAllowWhileIdle(
-                          AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent
-                      )
+                      alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent)
                   } catch (e: Exception) {
                   }
               }
@@ -969,16 +1116,19 @@ jobs:
                   try { alarmManager.cancel(pendingIntent) } catch (e: Exception) {}
               }
 
-              private var clockStopIndex = 0
               private fun updateScreensaverClock() {
                   val clockRef = screensaverClock ?: return
                   val ampmRef = screensaverAmPm ?: return
 
+                  val now = SystemClock.elapsedRealtime()
+                  if (lastClockUpdateElapsed != 0L && now - lastClockUpdateElapsed < 5000L) return
+                  lastClockUpdateElapsed = now
+
                   val sdf = SimpleDateFormat("hh:mm", Locale.getDefault())
                   val ampmFmt = SimpleDateFormat("a", Locale.getDefault())
-                  val now = Date()
-                  clockRef.text = sdf.format(now)
-                  ampmRef.text = ampmFmt.format(now)
+                  val date = Date()
+                  clockRef.text = sdf.format(date)
+                  ampmRef.text = ampmFmt.format(date)
 
                   val density = resources.displayMetrics.density
                   val stops = listOf(-40f, 0f, 40f)
@@ -990,7 +1140,11 @@ jobs:
               }
 
               private fun exitScreensaver() {
+                  screensaverRunnable?.let { screensaverHandler?.removeCallbacks(it) }
+                  screensaverHandler = null
+                  screensaverRunnable = null
                   cancelClockAlarm()
+
                   screensaverView?.let {
                       try { windowManager.removeView(it) } catch (e: Exception) {}
                   }
@@ -1126,6 +1280,7 @@ jobs:
                   hideMenu()
                   exitScreensaver()
                   closeLens()
+                  try { mediaProjection?.stop() } catch (e: Exception) {}
                   if (::bubbleContainer.isInitialized && ::windowManager.isInitialized) {
                       windowManager.removeView(bubbleContainer)
                   }
@@ -1140,10 +1295,9 @@ jobs:
               <uses-permission android:name="android.permission.VIBRATE" />
               <uses-permission android:name="android.permission.WRITE_SETTINGS" />
               <uses-permission android:name="android.permission.INTERNET" />
-              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-              <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
               <application
                   android:allowBackup="true"
@@ -1160,6 +1314,12 @@ jobs:
                       </intent-filter>
                   </activity>
 
+                  <activity
+                      android:name=".ScreenCaptureRequestActivity"
+                      android:theme="@android:style/Theme.Translucent.NoTitleBar"
+                      android:excludeFromRecents="true"
+                      android:exported="false" />
+
                   <receiver
                       android:name=".ClockTickReceiver"
                       android:exported="false" />
@@ -1168,6 +1328,7 @@ jobs:
                       android:name=".AssistiveTouchService"
                       android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
                       android:exported="true"
+                      android:foregroundServiceType="mediaProjection"
                       android:configChanges="orientation|screenSize|screenLayout">
                       <intent-filter>
                           <action android:name="android.accessibilityservice.AccessibilityService" />
