@@ -1,4 +1,4 @@
-name: Build AssistiveTouch APK
+name: Build Greytouch APK
 
 on:
   workflow_dispatch:
@@ -28,58 +28,99 @@ jobs:
           cat > app/src/main/java/com/grey/touch/MainActivity.kt << 'KOTLIN_EOF'
           package com.grey.touch
 
-          import android.Manifest
           import android.content.Intent
-          import android.content.pm.PackageManager
-          import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
           import android.text.TextUtils
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
           import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
-          import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.RectangleShape
           import androidx.compose.ui.unit.dp
-          import androidx.core.app.ActivityCompat
-          import androidx.core.content.ContextCompat
+          import androidx.compose.ui.unit.sp
 
           class MainActivity : ComponentActivity() {
+
+              private var enabled by mutableStateOf(false)
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  requestStoragePermissionIfNeeded()
+                  enabled = isServiceEnabled()
 
                   setContent {
-                      MaterialTheme {
-                          Surface(modifier = Modifier.fillMaxSize()) {
-                              var enabled by remember { mutableStateOf(isServiceEnabled()) }
+                      val bg = Color(0xFF1C1C1E)
+                      val grey = Color(0xFF3A3A3C)
+                      Box(modifier = Modifier.fillMaxSize().background(bg)) {
+                          Column(
+                              modifier = Modifier
+                                  .fillMaxSize()
+                                  .verticalScroll(rememberScrollState())
+                                  .padding(24.dp)
+                          ) {
+                              Text("Greytouch", color = Color.White, fontSize = 26.sp)
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Text(
+                                  if (enabled) "Status: enabled" else "Status: not enabled",
+                                  color = Color.White,
+                                  fontSize = 16.sp
+                              )
+                              Spacer(modifier = Modifier.height(24.dp))
 
-                              Column(
-                                  modifier = Modifier.fillMaxSize().padding(24.dp),
-                                  horizontalAlignment = Alignment.CenterHorizontally,
-                                  verticalArrangement = Arrangement.Center
+                              Text("Setup", color = Color.White, fontSize = 18.sp)
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Text(
+                                  "1. Tap the button below to open Accessibility Settings.\n" +
+                                  "2. Find Greytouch in the list of installed apps.\n" +
+                                  "3. Turn it on and allow.\n" +
+                                  "4. For brightness controls, allow \"Modify system settings\" when asked.",
+                                  color = Color(0xFFD0D0D4),
+                                  fontSize = 15.sp,
+                                  lineHeight = 22.sp
+                              )
+                              Spacer(modifier = Modifier.height(24.dp))
+
+                              Text("Gestures", color = Color.White, fontSize = 18.sp)
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Text(
+                                  "Tap: Back\n" +
+                                  "Double tap: Lock screen\n" +
+                                  "Swipe up: Recents\n" +
+                                  "Swipe left or right: Home\n" +
+                                  "Swipe down: Menu\n" +
+                                  "Hold, then drag: Move the bubble (snaps to the nearest edge)",
+                                  color = Color(0xFFD0D0D4),
+                                  fontSize = 15.sp,
+                                  lineHeight = 22.sp
+                              )
+                              Spacer(modifier = Modifier.height(24.dp))
+
+                              Text("Menu", color = Color.White, fontSize = 18.sp)
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Text(
+                                  "Screensaver, Screenshot, Volume - / +, Brightness - / +.\n" +
+                                  "Hold the volume or brightness buttons to repeat.",
+                                  color = Color(0xFFD0D0D4),
+                                  fontSize = 15.sp,
+                                  lineHeight = 22.sp
+                              )
+                              Spacer(modifier = Modifier.height(32.dp))
+
+                              Button(
+                                  onClick = { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
+                                  shape = RectangleShape,
+                                  colors = ButtonDefaults.buttonColors(
+                                      containerColor = grey,
+                                      contentColor = Color.White
+                                  )
                               ) {
-                                  Text(
-                                      text = if (enabled) "AssistiveTouch is enabled" else "AssistiveTouch is not enabled",
-                                      style = MaterialTheme.typography.titleLarge
-                                  )
-                                  Spacer(modifier = Modifier.height(16.dp))
-                                  Text(
-                                      text = "This app needs Accessibility permission to show the floating bubble and control back/recents. Photo access is used briefly for Screen Search.",
-                                      style = MaterialTheme.typography.bodyMedium
-                                  )
-                                  Spacer(modifier = Modifier.height(24.dp))
-                                  Button(onClick = {
-                                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                                  }) {
-                                      Text("Open Accessibility Settings")
-                                  }
-                              }
-
-                              LaunchedEffect(Unit) {
-                                  enabled = isServiceEnabled()
+                                  Text("Open Accessibility Settings")
                               }
                           }
                       }
@@ -88,18 +129,7 @@ jobs:
 
               override fun onResume() {
                   super.onResume()
-                  recreate()
-              }
-
-              private fun requestStoragePermissionIfNeeded() {
-                  val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                      Manifest.permission.READ_MEDIA_IMAGES
-                  } else {
-                      Manifest.permission.READ_EXTERNAL_STORAGE
-                  }
-                  if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
-                      ActivityCompat.requestPermissions(this, arrayOf(permission), 1001)
-                  }
+                  enabled = isServiceEnabled()
               }
 
               private fun isServiceEnabled(): Boolean {
@@ -142,9 +172,7 @@ jobs:
           import android.content.Context
           import android.content.Intent
           import android.content.SharedPreferences
-          import android.content.pm.PackageManager
           import android.content.res.Configuration
-          import android.database.Cursor
           import android.graphics.Color
           import android.graphics.PixelFormat
           import android.graphics.Typeface
@@ -156,18 +184,13 @@ jobs:
           import android.os.VibrationEffect
           import android.os.Vibrator
           import android.os.VibratorManager
-          import android.provider.MediaStore
-          import android.util.Base64
           import android.util.DisplayMetrics
           import android.view.*
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityWindowInfo
-          import android.webkit.WebView
-          import android.webkit.WebViewClient
           import android.widget.FrameLayout
           import android.widget.LinearLayout
           import android.widget.TextView
-          import java.io.File
           import java.text.SimpleDateFormat
           import java.util.*
           import kotlin.math.abs
@@ -182,6 +205,12 @@ jobs:
                   const val SWIPE_THRESHOLD_PX = 60
                   const val REPEAT_INTERVAL_MS = 180L
                   const val CLOCK_ALARM_REQUEST_CODE = 4201
+
+                  // false = square bubble (matches the flat menu), true = round bubble
+                  const val BUBBLE_OVAL = false
+
+                  val GREY_DARK = Color.rgb(28, 28, 30)
+                  val GREY = Color.rgb(58, 58, 60)
 
                   var instance: AssistiveTouchService? = null
               }
@@ -200,8 +229,6 @@ jobs:
               private var screensaverClock: TextView? = null
               private var screensaverAmPm: TextView? = null
               private var preScreensaverBrightness: Int = -1
-              private var lensView: WebView? = null
-              private var lensOverlay: FrameLayout? = null
 
               private var screenWidth = 0
               private var screenHeight = 0
@@ -265,7 +292,7 @@ jobs:
                   bubbleSizePx = (56 * density).toInt()
                   moveThresholdPx = (MOVE_THRESHOLD_DP * density).toInt()
 
-                  buildBubbleViews(density)
+                  buildBubbleViews()
                   applyIdleAppearance()
 
                   val savedRatioX = prefs.getFloat("anchor_edge", 1f)
@@ -295,7 +322,7 @@ jobs:
                   }
               }
 
-              private fun buildBubbleViews(density: Float) {
+              private fun buildBubbleViews() {
                   bubbleContainer = FrameLayout(this)
 
                   ringOuter = View(this).apply {
@@ -307,7 +334,7 @@ jobs:
                           gravity = Gravity.CENTER
                       }
                   }
-                  val coreSize = (bubbleSizePx * 0.36f).toInt()
+                  val coreSize = (bubbleSizePx * 0.34f).toInt()
                   ringCore = View(this).apply {
                       layoutParams = FrameLayout.LayoutParams(coreSize, coreSize).apply {
                           gravity = Gravity.CENTER
@@ -389,23 +416,28 @@ jobs:
                   }
               }
 
-              private fun circleDrawable(color: Int): GradientDrawable {
+              // ---------- Bubble look (grey + white accent, negative on touch) ----------
+
+              private fun boxDrawable(fill: Int, stroke: Int = 0, strokeDp: Int = 0): GradientDrawable {
+                  val density = resources.displayMetrics.density
                   return GradientDrawable().apply {
-                      shape = GradientDrawable.OVAL
-                      setColor(color)
+                      shape = if (BUBBLE_OVAL) GradientDrawable.OVAL else GradientDrawable.RECTANGLE
+                      setColor(fill)
+                      if (strokeDp > 0) setStroke((strokeDp * density).toInt().coerceAtLeast(1), stroke)
                   }
               }
 
               private fun applyIdleAppearance() {
-                  ringOuter.background = circleDrawable(Color.argb(90, 20, 20, 25))
-                  ringMiddle.background = circleDrawable(Color.argb(100, 120, 120, 128))
-                  ringCore.background = circleDrawable(Color.argb(130, 255, 255, 255))
+                  ringOuter.background = boxDrawable(Color.argb(110, 58, 58, 60), Color.argb(160, 255, 255, 255), 1)
+                  ringMiddle.background = boxDrawable(Color.argb(120, 28, 28, 30))
+                  ringCore.background = boxDrawable(Color.argb(150, 255, 255, 255))
               }
 
+              // negative: grey becomes white, white becomes black
               private fun applyTouchedAppearance() {
-                  ringOuter.background = circleDrawable(Color.argb(242, 20, 20, 25))
-                  ringMiddle.background = circleDrawable(Color.argb(242, 150, 150, 158))
-                  ringCore.background = circleDrawable(Color.WHITE)
+                  ringOuter.background = boxDrawable(Color.WHITE, Color.WHITE, 1)
+                  ringMiddle.background = boxDrawable(GREY)
+                  ringCore.background = boxDrawable(Color.BLACK)
               }
 
               private fun lockPhone() {
@@ -430,10 +462,10 @@ jobs:
                       orientation = LinearLayout.VERTICAL
                       background = GradientDrawable().apply {
                           shape = GradientDrawable.RECTANGLE
-                          cornerRadius = 16 * density
-                          setColor(Color.argb(245, 32, 32, 35))
+                          setColor(GREY_DARK)
+                          setStroke((1 * density).toInt().coerceAtLeast(1), Color.argb(200, 255, 255, 255))
                       }
-                      val pad = (16 * density).toInt()
+                      val pad = (12 * density).toInt()
                       setPadding(pad, pad, pad, pad)
                       layoutParams = FrameLayout.LayoutParams(
                           (240 * density).toInt(),
@@ -444,70 +476,31 @@ jobs:
                       isClickable = true
                   }
 
-                  val row1 = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      layoutParams = LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT,
-                          LinearLayout.LayoutParams.WRAP_CONTENT
-                      )
-                  }
-                  row1.addView(menuTile("Screensaver") { hideMenu(); startScreensaver() })
-                  row1.addView(menuTile("Screenshot") { hideMenu(); takeSystemScreenshot() })
-
-                  val row2 = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      layoutParams = LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT,
-                          LinearLayout.LayoutParams.WRAP_CONTENT
-                      )
-                  }
-                  row2.addView(repeatableMenuTile("Vol -") { adjustVolume(false) })
-                  row2.addView(repeatableMenuTile("Vol +") { adjustVolume(true) })
-
-                  val row3 = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      layoutParams = LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT,
-                          LinearLayout.LayoutParams.WRAP_CONTENT
-                      )
-                  }
-                  row3.addView(repeatableMenuTile("Bright -") { adjustBrightness(false) })
-                  row3.addView(repeatableMenuTile("Bright +") { adjustBrightness(true) })
-
-                  val row4 = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      layoutParams = LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT,
-                          LinearLayout.LayoutParams.WRAP_CONTENT
-                      )
-                  }
-                  val searchTile = TextView(this).apply {
-                      text = "Screen Search"
+                  val title = TextView(this).apply {
+                      text = "GREYTOUCH"
                       setTextColor(Color.WHITE)
-                      textSize = 13f
-                      gravity = Gravity.CENTER
-                      val padV = (12 * density).toInt()
-                      setPadding(padV, padV, padV, padV)
-                      background = GradientDrawable().apply {
-                          shape = GradientDrawable.RECTANGLE
-                          cornerRadius = 12 * density
-                          setColor(Color.argb(60, 255, 255, 255))
-                      }
-                      layoutParams = LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT,
-                          LinearLayout.LayoutParams.WRAP_CONTENT
-                      )
-                      setOnClickListener { hideMenu(); startScreenSearch() }
+                      textSize = 11f
+                      letterSpacing = 0.25f
+                      setTypeface(typeface, Typeface.BOLD)
+                      val m = (4 * density).toInt()
+                      setPadding(m, 0, m, (8 * density).toInt())
                   }
-                  row4.addView(searchTile)
 
-                  card.addView(row1)
+                  card.addView(title)
+                  card.addView(menuRow(
+                      menuTile("Screensaver", false) { hideMenu(); startScreensaver() },
+                      menuTile("Screenshot", false) { hideMenu(); takeSystemScreenshot() }
+                  ))
                   card.addView(spacer(density))
-                  card.addView(row2)
+                  card.addView(menuRow(
+                      menuTile("Vol -", true) { adjustVolume(false) },
+                      menuTile("Vol +", true) { adjustVolume(true) }
+                  ))
                   card.addView(spacer(density))
-                  card.addView(row3)
-                  card.addView(spacer(density))
-                  card.addView(row4)
+                  card.addView(menuRow(
+                      menuTile("Bright -", true) { adjustBrightness(false) },
+                      menuTile("Bright +", true) { adjustBrightness(true) }
+                  ))
 
                   overlay.addView(card)
 
@@ -531,6 +524,17 @@ jobs:
                   menuView = null
               }
 
+              private fun menuRow(vararg tiles: View): LinearLayout {
+                  return LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      )
+                      tiles.forEach { addView(it) }
+                  }
+              }
+
               private fun spacer(density: Float): View {
                   return View(this).apply {
                       layoutParams = LinearLayout.LayoutParams(
@@ -540,63 +544,50 @@ jobs:
                   }
               }
 
-              private fun menuTile(label: String, onClick: () -> Unit): View {
-                  val density = resources.displayMetrics.density
-                  return TextView(this).apply {
-                      text = label
-                      setTextColor(Color.WHITE)
-                      textSize = 13f
-                      gravity = Gravity.CENTER
-                      val padV = (12 * density).toInt()
-                      setPadding(padV, padV, padV, padV)
-                      background = GradientDrawable().apply {
-                          shape = GradientDrawable.RECTANGLE
-                          cornerRadius = 12 * density
-                          setColor(Color.argb(60, 255, 255, 255))
-                      }
-                      layoutParams = LinearLayout.LayoutParams(
-                          0,
-                          LinearLayout.LayoutParams.WRAP_CONTENT,
-                          1f
-                      ).apply {
-                          val m = (4 * density).toInt()
-                          setMargins(m, 0, m, 0)
-                      }
-                      setOnClickListener { onClick() }
-                  }
+              // Flat tile: grey with white text; while pressed it goes negative (white with black text)
+              private fun setTileLook(tv: TextView, pressed: Boolean) {
+                  tv.setBackgroundColor(if (pressed) Color.WHITE else GREY)
+                  tv.setTextColor(if (pressed) Color.BLACK else Color.WHITE)
               }
 
               @SuppressLint("ClickableViewAccessibility")
-              private fun repeatableMenuTile(label: String, action: () -> Unit): View {
+              private fun menuTile(label: String, repeat: Boolean, action: () -> Unit): View {
                   val density = resources.displayMetrics.density
                   return TextView(this).apply {
                       text = label
-                      setTextColor(Color.WHITE)
                       textSize = 13f
                       gravity = Gravity.CENTER
-                      val padV = (12 * density).toInt()
+                      setTileLook(this, false)
+                      val padV = (14 * density).toInt()
                       setPadding(padV, padV, padV, padV)
-                      background = GradientDrawable().apply {
-                          shape = GradientDrawable.RECTANGLE
-                          cornerRadius = 12 * density
-                          setColor(Color.argb(60, 255, 255, 255))
-                      }
                       layoutParams = LinearLayout.LayoutParams(
                           0,
                           LinearLayout.LayoutParams.WRAP_CONTENT,
                           1f
                       ).apply {
-                          val m = (4 * density).toInt()
+                          val m = (3 * density).toInt()
                           setMargins(m, 0, m, 0)
                       }
-                      setOnTouchListener { _, event ->
+                      setOnTouchListener { v, event ->
                           when (event.action) {
                               MotionEvent.ACTION_DOWN -> {
-                                  startRepeat(action)
+                                  setTileLook(this, true)
+                                  if (repeat) startRepeat(action)
                                   true
                               }
-                              MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                                  stopRepeat()
+                              MotionEvent.ACTION_MOVE -> true
+                              MotionEvent.ACTION_UP -> {
+                                  setTileLook(this, false)
+                                  if (repeat) {
+                                      stopRepeat()
+                                  } else if (event.x >= 0f && event.x <= v.width && event.y >= 0f && event.y <= v.height) {
+                                      action()
+                                  }
+                                  true
+                              }
+                              MotionEvent.ACTION_CANCEL -> {
+                                  setTileLook(this, false)
+                                  if (repeat) stopRepeat()
                                   true
                               }
                               else -> false
@@ -664,7 +655,7 @@ jobs:
                   setBrightness(current + if (up) step else -step)
               }
 
-              // ---------- Plain screenshot (safe, unchanged) ----------
+              // ---------- Plain screenshot ----------
 
               private fun takeSystemScreenshot() {
                   if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
@@ -673,191 +664,6 @@ jobs:
                   }
                   performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
                   android.widget.Toast.makeText(this, "Screenshot captured", android.widget.Toast.LENGTH_SHORT).show()
-              }
-
-              // ---------- Screen Search: safe system screenshot + retry-based MediaStore lookup ----------
-
-              private fun hasImagePermission(): Boolean {
-                  val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                      android.Manifest.permission.READ_MEDIA_IMAGES
-                  } else {
-                      android.Manifest.permission.READ_EXTERNAL_STORAGE
-                  }
-                  return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
-              }
-
-              private fun startScreenSearch() {
-                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-                      android.widget.Toast.makeText(this, "Screen Search requires Android 9+", android.widget.Toast.LENGTH_SHORT).show()
-                      return
-                  }
-                  if (!hasImagePermission()) {
-                      android.widget.Toast.makeText(this, "Open the app once to grant photo access for Screen Search", android.widget.Toast.LENGTH_LONG).show()
-                      return
-                  }
-
-                  val triggerTime = System.currentTimeMillis()
-                  performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
-                  attemptFindScreenshot(triggerTime, attempt = 1)
-              }
-
-              private val retryDelays = listOf(1200L, 1500L, 2000L, 2500L, 3000L, 3000L)
-
-              private fun attemptFindScreenshot(triggerTime: Long, attempt: Int) {
-                  val delay = retryDelays[(attempt - 1).coerceIn(0, retryDelays.size - 1)]
-                  handler.postDelayed({
-                      val base64 = tryQueryLatestScreenshot(triggerTime)
-                      if (base64 != null) {
-                          openLensWithBase64(base64)
-                      } else if (attempt < retryDelays.size) {
-                          attemptFindScreenshot(triggerTime, attempt + 1)
-                      } else {
-                          android.widget.Toast.makeText(this, "Couldn't find the screenshot after several tries", android.widget.Toast.LENGTH_LONG).show()
-                      }
-                  }, delay)
-              }
-
-              private fun tryQueryLatestScreenshot(afterTimeMs: Long): String? {
-                  return try {
-                      val projection = arrayOf(
-                          MediaStore.Images.Media._ID,
-                          MediaStore.Images.Media.DATA,
-                          MediaStore.Images.Media.DATE_ADDED
-                      )
-                      val selection = "${MediaStore.Images.Media.DATE_ADDED} >= ?"
-                      val selectionArgs = arrayOf(((afterTimeMs / 1000) - 3).toString())
-                      val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
-
-                      val cursor: Cursor? = contentResolver.query(
-                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                          projection, selection, selectionArgs, sortOrder
-                      )
-
-                      cursor?.use {
-                          if (it.moveToFirst()) {
-                              val dataIdx = it.getColumnIndexOrThrow(MediaStore.Images.Media.DATA)
-                              val idIdx = it.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-                              val path = it.getString(dataIdx)
-                              val id = it.getLong(idIdx)
-
-                              val file = File(path)
-                              if (file.exists()) {
-                                  val bytes = file.readBytes()
-                                  val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-
-                                  try {
-                                      file.delete()
-                                      contentResolver.delete(
-                                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                                          "${MediaStore.Images.Media._ID}=?", arrayOf(id.toString())
-                                      )
-                                  } catch (e: Exception) {
-                                  }
-
-                                  base64
-                              } else null
-                          } else null
-                      }
-                  } catch (e: Exception) {
-                      null
-                  }
-              }
-
-              @SuppressLint("SetJavaScriptEnabled")
-              private fun openLensWithBase64(base64: String) {
-                  val overlay = FrameLayout(this).apply {
-                      setBackgroundColor(Color.BLACK)
-                  }
-
-                  val closeBtn = TextView(this).apply {
-                      text = "Close"
-                      setTextColor(Color.WHITE)
-                      textSize = 14f
-                      val density = resources.displayMetrics.density
-                      setPadding((16 * density).toInt(), (12 * density).toInt(), (16 * density).toInt(), (12 * density).toInt())
-                      background = GradientDrawable().apply {
-                          shape = GradientDrawable.RECTANGLE
-                          cornerRadius = 12 * density
-                          setColor(Color.argb(180, 40, 40, 40))
-                      }
-                      layoutParams = FrameLayout.LayoutParams(
-                          FrameLayout.LayoutParams.WRAP_CONTENT,
-                          FrameLayout.LayoutParams.WRAP_CONTENT
-                      ).apply {
-                          gravity = Gravity.TOP or Gravity.END
-                          val m = (24 * density).toInt()
-                          setMargins(0, m, m, 0)
-                      }
-                      setOnClickListener { closeLens() }
-                  }
-
-                  val webView = WebView(this).apply {
-                      settings.javaScriptEnabled = true
-                      settings.domStorageEnabled = true
-                      settings.useWideViewPort = true
-                      settings.loadWithOverviewMode = true
-                      // force desktop rendering — mobile UA shows a broken Lens placeholder,
-                      // desktop UA shows the real upload UI (confirmed by manual testing)
-                      settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-
-                      webViewClient = object : WebViewClient() {
-                          override fun onPageFinished(view: WebView?, url: String?) {
-                              super.onPageFinished(view, url)
-                              injectImageIntoLens(view, base64)
-                          }
-                      }
-                      loadUrl("https://lens.google.com/upload?safe=off")
-                  }
-
-                  overlay.addView(webView, FrameLayout.LayoutParams(
-                      FrameLayout.LayoutParams.MATCH_PARENT,
-                      FrameLayout.LayoutParams.MATCH_PARENT
-                  ))
-                  overlay.addView(closeBtn)
-
-                  val lensParams = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.MATCH_PARENT,
-                      WindowManager.LayoutParams.MATCH_PARENT,
-                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                      PixelFormat.OPAQUE
-                  )
-
-                  windowManager.addView(overlay, lensParams)
-                  lensOverlay = overlay
-                  lensView = webView
-              }
-
-              private fun injectImageIntoLens(view: WebView?, base64: String) {
-                  val js = """
-                      (function() {
-                          function dataURLtoFile(dataurl, filename) {
-                              var arr = dataurl.split(','), mime = 'image/jpeg',
-                                  bstr = atob(arr[0]), n = bstr.length, u8arr = new Uint8Array(n);
-                              while (n--) { u8arr[n] = bstr.charCodeAt(n); }
-                              return new File([u8arr], filename, {type: mime});
-                          }
-                          var file = dataURLtoFile('data:image/jpeg;base64,$base64', 'screenshot.jpg');
-                          var dt = new DataTransfer();
-                          dt.items.add(file);
-                          var input = document.querySelector('input[type="file"]');
-                          if (input) {
-                              input.files = dt.files;
-                              var event = new Event('change', { bubbles: true });
-                              input.dispatchEvent(event);
-                          }
-                      })();
-                  """.trimIndent()
-                  view?.evaluateJavascript(js, null)
-              }
-
-              private fun closeLens() {
-                  lensOverlay?.let {
-                      try { windowManager.removeView(it) } catch (e: Exception) {}
-                  }
-                  lensView?.destroy()
-                  lensView = null
-                  lensOverlay = null
               }
 
               // ---------- Screensaver ----------
@@ -1172,9 +978,8 @@ jobs:
                   instance = null
                   hideMenu()
                   exitScreensaver()
-                  closeLens()
                   if (::bubbleContainer.isInitialized && ::windowManager.isInitialized) {
-                      windowManager.removeView(bubbleContainer)
+                      try { windowManager.removeView(bubbleContainer) } catch (e: Exception) {}
                   }
               }
           }
@@ -1186,15 +991,12 @@ jobs:
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.VIBRATE" />
               <uses-permission android:name="android.permission.WRITE_SETTINGS" />
-              <uses-permission android:name="android.permission.INTERNET" />
-              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
               <application
                   android:allowBackup="true"
                   android:icon="@mipmap/ic_launcher"
-                  android:label="AssistiveTouch"
-                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  android:label="Greytouch"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
 
                   <activity
                       android:name=".MainActivity"
@@ -1211,6 +1013,7 @@ jobs:
 
                   <service
                       android:name=".AssistiveTouchService"
+                      android:label="Greytouch"
                       android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
                       android:exported="true"
                       android:configChanges="orientation|screenSize|screenLayout">
@@ -1239,8 +1042,8 @@ jobs:
           cat > app/src/main/res/values/strings.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <string name="app_name">AssistiveTouch</string>
-              <string name="accessibility_service_description">Enables the floating AssistiveTouch bubble for back and recent apps gestures.</string>
+              <string name="app_name">Greytouch</string>
+              <string name="accessibility_service_description">Enables the Greytouch floating bubble for back, home, recents and quick menu gestures.</string>
           </resources>
           EOF
 
@@ -1288,6 +1091,27 @@ jobs:
                   targetSdk = 34
                   versionCode = (project.findProperty("BUILD_NUMBER") as String? ?: "1").toInt()
                   versionName = "1.0.${project.findProperty("BUILD_NUMBER") as String? ?: "1"}"
+              }
+
+              signingConfigs {
+                  create("test") {
+                      storeFile = rootProject.file("test.keystore")
+                      storePassword = "android"
+                      keyAlias = "test"
+                      keyPassword = "android"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("test")
+                  }
+              }
+
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
               }
 
               buildFeatures {
@@ -1342,7 +1166,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "AssistiveTouch"
+          rootProject.name = "Greytouch"
           include(":app")
           EOF
 
@@ -1351,16 +1175,32 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
+      - name: Cache test keystore
+        uses: actions/cache@v4
+        with:
+          path: test.keystore
+          key: greytouch-test-keystore-v1
+
+      - name: Create test keystore
+        run: |
+          if [ ! -f test.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore test.keystore \
+              -storepass android -keypass android \
+              -alias test -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Greytouch Test, O=Grey, C=PH"
+          fi
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build APK
         run: |
           chmod +x gradlew || (gradle wrapper && chmod +x gradlew)
-          ./gradlew assembleDebug -PBUILD_NUMBER=${{ github.run_number }}
+          ./gradlew assembleRelease -PBUILD_NUMBER=${{ github.run_number }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AssistiveTouch-debug-${{ github.run_number }}
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: Greytouch-${{ github.run_number }}
+          path: app/build/outputs/apk/release/app-release.apk
