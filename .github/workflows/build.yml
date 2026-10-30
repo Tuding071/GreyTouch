@@ -91,7 +91,7 @@ jobs:
                               Text(
                                   "Tap the bubble: open the menu.\n" +
                                   "Tap outside the menu: close it.\n" +
-                                  "Hold the bubble, then drag: move it (snaps to the nearest edge).",
+                                  "The bubble has a fixed position: right edge in portrait, top edge in landscape.",
                                   color = body,
                                   fontSize = 15.sp,
                                   lineHeight = 22.sp
@@ -235,7 +235,6 @@ jobs:
           import android.app.PendingIntent
           import android.content.Context
           import android.content.Intent
-          import android.content.SharedPreferences
           import android.content.res.Configuration
           import android.graphics.Color
           import android.graphics.PixelFormat
@@ -257,16 +256,16 @@ jobs:
           import android.widget.TextView
           import java.text.SimpleDateFormat
           import java.util.*
-          import kotlin.math.abs
 
           class AssistiveTouchService : AccessibilityService() {
 
               companion object {
-                  const val HOLD_MIN_MS = 250L
-                  const val MOVE_THRESHOLD_DP = 10
                   const val SWIPE_THRESHOLD_PX = 60
                   const val REPEAT_INTERVAL_MS = 180L
                   const val CLOCK_ALARM_REQUEST_CODE = 4201
+
+                  // Landscape: bubble sits on the top edge (true) or the bottom edge (false)
+                  const val LANDSCAPE_AT_TOP = true
 
                   val PANEL_BG = Color.argb(235, 30, 30, 32)
                   val PANEL_BORDER = Color.argb(36, 255, 255, 255)
@@ -282,7 +281,6 @@ jobs:
               private lateinit var ringInner: View
               private lateinit var ringCore: View
               private lateinit var params: WindowManager.LayoutParams
-              private lateinit var prefs: SharedPreferences
               private var vibrator: Vibrator? = null
 
               private var menuView: FrameLayout? = null
@@ -294,24 +292,20 @@ jobs:
               private var screenWidth = 0
               private var screenHeight = 0
               private var bubbleSizePx = 0
-              private var moveThresholdPx = 0
-
-              private var downRawX = 0f
-              private var downRawY = 0f
-              private var initialX = 0
-              private var initialY = 0
-              private var isDragging = false
-              private var longPressTriggered = false
-              private var moved = false
 
               private var keyboardVisible = false
               private var preKeyboardY = 0
 
               private val handler = Handler(Looper.getMainLooper())
-              private val longPressRunnable = Runnable {
-                  longPressTriggered = true
-                  isDragging = true
-                  vibrate()
+
+              private val repositionRunnable = Runnable {
+                  if (::windowManager.isInitialized && ::bubbleContainer.isInitialized) {
+                      measureScreen()
+                      keyboardVisible = false
+                      computeBubblePosition()
+                      try { windowManager.updateViewLayout(bubbleContainer, params) } catch (e: Exception) {}
+                      checkKeyboardState()
+                  }
               }
 
               private var repeatHandler: Handler? = null
@@ -329,10 +323,10 @@ jobs:
                   instance = this
               }
 
+              @SuppressLint("ClickableViewAccessibility")
               override fun onServiceConnected() {
                   super.onServiceConnected()
                   instance = this
-                  prefs = getSharedPreferences("assistive_touch_prefs", Context.MODE_PRIVATE)
                   windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
                   vibrator = try {
@@ -348,18 +342,10 @@ jobs:
                   }
 
                   measureScreen()
-
                   bubbleSizePx = dp(60f)
-                  moveThresholdPx = dp(MOVE_THRESHOLD_DP.toFloat())
 
                   buildBubbleViews()
                   applyIdleAppearance()
-
-                  val savedRatioX = prefs.getFloat("anchor_edge", 1f)
-                  val savedRatioY = prefs.getFloat("ratio_y", 0.5f)
-
-                  val startX = if (savedRatioX <= 0f) 0 else screenWidth - bubbleSizePx
-                  val startY = ((screenHeight - bubbleSizePx) * savedRatioY).toInt()
 
                   params = WindowManager.LayoutParams(
                       bubbleSizePx,
@@ -370,11 +356,10 @@ jobs:
                       PixelFormat.TRANSLUCENT
                   ).apply {
                       gravity = Gravity.TOP or Gravity.START
-                      x = startX
-                      y = startY.coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
                   }
+                  computeBubblePosition()
 
-                  bubbleContainer.setOnTouchListener { _, event -> handleTouch(event) }
+                  bubbleContainer.setOnTouchListener { v, event -> handleTouch(v, event) }
                   windowManager.addView(bubbleContainer, params)
 
                   serviceInfo = serviceInfo?.apply {
@@ -437,29 +422,43 @@ jobs:
                   ringCore.background = ovalDrawable(Color.BLACK)
               }
 
+              // ---------- Fixed placement ----------
+              // Portrait: right edge, vertically centered.
+              // Landscape: top (or bottom) edge, horizontally centered.
+
               private fun measureScreen() {
-                  val metrics = DisplayMetrics()
-                  @Suppress("DEPRECATION")
-                  windowManager.defaultDisplay.getMetrics(metrics)
-                  screenWidth = metrics.widthPixels
-                  screenHeight = metrics.heightPixels
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      val b = windowManager.currentWindowMetrics.bounds
+                      screenWidth = b.width()
+                      screenHeight = b.height()
+                  } else {
+                      val metrics = DisplayMetrics()
+                      @Suppress("DEPRECATION")
+                      windowManager.defaultDisplay.getRealMetrics(metrics)
+                      screenWidth = metrics.widthPixels
+                      screenHeight = metrics.heightPixels
+                  }
+              }
+
+              private fun computeBubblePosition() {
+                  val landscape = screenWidth > screenHeight
+                  if (landscape) {
+                      params.x = ((screenWidth - bubbleSizePx) / 2).coerceAtLeast(0)
+                      params.y = if (LANDSCAPE_AT_TOP) 0 else (screenHeight - bubbleSizePx).coerceAtLeast(0)
+                  } else {
+                      params.x = (screenWidth - bubbleSizePx).coerceAtLeast(0)
+                      params.y = ((screenHeight - bubbleSizePx) / 2).coerceAtLeast(0)
+                  }
               }
 
               override fun onConfigurationChanged(newConfig: Configuration) {
                   super.onConfigurationChanged(newConfig)
                   if (!::windowManager.isInitialized || !::bubbleContainer.isInitialized) return
 
-                  handler.postDelayed({
-                      measureScreen()
-                      val anchorEdge = prefs.getFloat("anchor_edge", 1f)
-                      val ratioY = prefs.getFloat("ratio_y", 0.5f)
-
-                      params.x = if (anchorEdge <= 0f) 0 else screenWidth - bubbleSizePx
-                      params.y = ((screenHeight - bubbleSizePx) * ratioY).toInt()
-                          .coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
-
-                      windowManager.updateViewLayout(bubbleContainer, params)
-                  }, 150L)
+                  // metrics can lag behind the rotation, so re-place twice
+                  handler.removeCallbacks(repositionRunnable)
+                  handler.postDelayed(repositionRunnable, 150L)
+                  handler.postDelayed(repositionRunnable, 600L)
               }
 
               // ---------- Keyboard avoidance ----------
@@ -507,7 +506,32 @@ jobs:
                   }
               }
 
-              // ---------- Menu (2-column grid, tap bubble to open) ----------
+              // ---------- Touch: tap = open menu ----------
+
+              private fun handleTouch(v: View, event: MotionEvent): Boolean {
+                  when (event.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          applyTouchedAppearance()
+                          return true
+                      }
+                      MotionEvent.ACTION_MOVE -> return true
+                      MotionEvent.ACTION_UP -> {
+                          applyIdleAppearance()
+                          if (event.x >= 0f && event.x <= v.width && event.y >= 0f && event.y <= v.height) {
+                              vibrate()
+                              showMenu()
+                          }
+                          return true
+                      }
+                      MotionEvent.ACTION_CANCEL -> {
+                          applyIdleAppearance()
+                          return true
+                      }
+                  }
+                  return false
+              }
+
+              // ---------- Menu (2-column grid) ----------
 
               private fun showMenu() {
                   if (menuView != null) return
@@ -931,96 +955,12 @@ jobs:
                   }
               }
 
-              // ---------- Touch: tap = menu, hold + drag = move ----------
-
-              private fun handleTouch(event: MotionEvent): Boolean {
-                  when (event.action) {
-                      MotionEvent.ACTION_DOWN -> {
-                          downRawX = event.rawX
-                          downRawY = event.rawY
-                          initialX = params.x
-                          initialY = params.y
-                          isDragging = false
-                          longPressTriggered = false
-                          moved = false
-                          applyTouchedAppearance()
-                          handler.postDelayed(longPressRunnable, HOLD_MIN_MS)
-                          return true
-                      }
-                      MotionEvent.ACTION_MOVE -> {
-                          val dx = event.rawX - downRawX
-                          val dy = event.rawY - downRawY
-
-                          if (!moved && (abs(dx) > moveThresholdPx || abs(dy) > moveThresholdPx)) {
-                              moved = true
-                              if (!longPressTriggered) handler.removeCallbacks(longPressRunnable)
-                          }
-
-                          if (isDragging) {
-                              params.x = (initialX + dx.toInt()).coerceIn(0, screenWidth - bubbleSizePx)
-                              params.y = (initialY + dy.toInt()).coerceIn(0, screenHeight - bubbleSizePx)
-                              windowManager.updateViewLayout(bubbleContainer, params)
-                          }
-                          return true
-                      }
-                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                          handler.removeCallbacks(longPressRunnable)
-                          applyIdleAppearance()
-
-                          if (isDragging) {
-                              snapToNearestEdge()
-                          } else if (!moved && event.action == MotionEvent.ACTION_UP) {
-                              vibrate()
-                              showMenu()
-                          }
-                          isDragging = false
-                          return true
-                      }
-                  }
-                  return false
-              }
-
-              private fun snapToNearestEdge() {
-                  val centerX = params.x + bubbleSizePx / 2
-                  val snapToLeft = centerX < screenWidth / 2
-                  val targetX = if (snapToLeft) 0 else screenWidth - bubbleSizePx
-
-                  val startX = params.x
-                  val distance = targetX - startX
-                  val steps = 8
-                  var step = 0
-
-                  val animator = object : Runnable {
-                      override fun run() {
-                          step++
-                          val progress = step.toFloat() / steps
-                          params.x = (startX + distance * progress).toInt()
-                          windowManager.updateViewLayout(bubbleContainer, params)
-                          if (step < steps) {
-                              handler.postDelayed(this, 8L)
-                          } else {
-                              params.x = targetX
-                              windowManager.updateViewLayout(bubbleContainer, params)
-                              saveAnchor(snapToLeft)
-                          }
-                      }
-                  }
-                  handler.post(animator)
-              }
-
-              private fun saveAnchor(isLeft: Boolean) {
-                  val ratioY = params.y.toFloat() / maxOf(1, screenHeight - bubbleSizePx)
-                  prefs.edit()
-                      .putFloat("anchor_edge", if (isLeft) 0f else 1f)
-                      .putFloat("ratio_y", ratioY.coerceIn(0f, 1f))
-                      .apply()
-              }
-
               override fun onInterrupt() {}
 
               override fun onDestroy() {
                   super.onDestroy()
                   instance = null
+                  handler.removeCallbacks(repositionRunnable)
                   hideMenu()
                   exitScreensaver()
                   if (::bubbleContainer.isInitialized && ::windowManager.isInitialized) {
@@ -1060,8 +1000,7 @@ jobs:
                       android:name=".AssistiveTouchService"
                       android:label="Greytouch"
                       android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-                      android:exported="true"
-                      android:configChanges="orientation|screenSize|screenLayout">
+                      android:exported="true">
                       <intent-filter>
                           <action android:name="android.accessibilityservice.AccessibilityService" />
                       </intent-filter>
@@ -1092,10 +1031,11 @@ jobs:
           </resources>
           EOF
 
+          # App icon = the bubble: dark ball, blue-grey ring, light ring, white dot
           cat > app/src/main/res/drawable/ic_launcher_background.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-              <solid android:color="#333333" />
+              <solid android:color="#1E1E20" />
           </shape>
           EOF
 
@@ -1107,8 +1047,14 @@ jobs:
               android:viewportWidth="108"
               android:viewportHeight="108">
               <path
+                  android:fillColor="#4A5462"
+                  android:pathData="M54,28 a26,26 0 1,0 0,52 a26,26 0 1,0 0,-52 Z" />
+              <path
+                  android:fillColor="#9AA5B2"
+                  android:pathData="M54,35 a19,19 0 1,0 0,38 a19,19 0 1,0 0,-38 Z" />
+              <path
                   android:fillColor="#FFFFFF"
-                  android:pathData="M39,29 L69,29 A10,10 0 0,1 79,39 L79,69 A10,10 0 0,1 69,79 L39,79 A10,10 0 0,1 29,69 L29,39 A10,10 0 0,1 39,29 Z" />
+                  android:pathData="M54,43 a11,11 0 1,0 0,22 a11,11 0 1,0 0,-22 Z" />
           </vector>
           EOF
 
