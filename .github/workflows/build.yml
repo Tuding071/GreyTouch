@@ -91,7 +91,9 @@ jobs:
                               Text(
                                   "Tap the bubble: open the menu.\n" +
                                   "Tap outside the menu: close it.\n" +
-                                  "The bubble has a fixed position: right edge in portrait, top edge in landscape.",
+                                  "Drag the bubble: move it. No hold needed.\n" +
+                                  "When released it snaps to the nearest edge: left or right in portrait, top or bottom in landscape.\n" +
+                                  "Portrait and landscape remember their own position.",
                                   color = body,
                                   fontSize = 15.sp,
                                   lineHeight = 22.sp
@@ -235,6 +237,7 @@ jobs:
           import android.app.PendingIntent
           import android.content.Context
           import android.content.Intent
+          import android.content.SharedPreferences
           import android.content.res.Configuration
           import android.graphics.Color
           import android.graphics.PixelFormat
@@ -256,6 +259,7 @@ jobs:
           import android.widget.TextView
           import java.text.SimpleDateFormat
           import java.util.*
+          import kotlin.math.abs
 
           class AssistiveTouchService : AccessibilityService() {
 
@@ -264,8 +268,13 @@ jobs:
                   const val REPEAT_INTERVAL_MS = 180L
                   const val CLOCK_ALARM_REQUEST_CODE = 4201
 
-                  // Landscape: bubble sits on the top edge (true) or the bottom edge (false)
-                  const val LANDSCAPE_AT_TOP = true
+                  // drag slop: finger must move this far before a touch counts as a drag instead of a tap
+                  const val DRAG_SLOP_DP = 10
+
+                  // true = on release the bubble snaps to the nearest edge
+                  //        (left/right in portrait, top/bottom in landscape)
+                  // false = bubble stays exactly where you drop it
+                  const val SNAP_TO_EDGE = true
 
                   val PANEL_BG = Color.argb(235, 30, 30, 32)
                   val PANEL_BORDER = Color.argb(36, 255, 255, 255)
@@ -281,6 +290,7 @@ jobs:
               private lateinit var ringInner: View
               private lateinit var ringCore: View
               private lateinit var params: WindowManager.LayoutParams
+              private lateinit var prefs: SharedPreferences
               private var vibrator: Vibrator? = null
 
               private var menuView: FrameLayout? = null
@@ -292,6 +302,13 @@ jobs:
               private var screenWidth = 0
               private var screenHeight = 0
               private var bubbleSizePx = 0
+              private var dragSlopPx = 0
+
+              private var downRawX = 0f
+              private var downRawY = 0f
+              private var initialX = 0
+              private var initialY = 0
+              private var dragging = false
 
               private var keyboardVisible = false
               private var preKeyboardY = 0
@@ -299,7 +316,7 @@ jobs:
               private val handler = Handler(Looper.getMainLooper())
 
               private val repositionRunnable = Runnable {
-                  if (::windowManager.isInitialized && ::bubbleContainer.isInitialized) {
+                  if (::windowManager.isInitialized && ::bubbleContainer.isInitialized && !dragging) {
                       measureScreen()
                       keyboardVisible = false
                       computeBubblePosition()
@@ -327,6 +344,7 @@ jobs:
               override fun onServiceConnected() {
                   super.onServiceConnected()
                   instance = this
+                  prefs = getSharedPreferences("assistive_touch_prefs", Context.MODE_PRIVATE)
                   windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
                   vibrator = try {
@@ -343,6 +361,7 @@ jobs:
 
                   measureScreen()
                   bubbleSizePx = dp(60f)
+                  dragSlopPx = dp(DRAG_SLOP_DP.toFloat())
 
                   buildBubbleViews()
                   applyIdleAppearance()
@@ -422,9 +441,7 @@ jobs:
                   ringCore.background = ovalDrawable(Color.BLACK)
               }
 
-              // ---------- Fixed placement ----------
-              // Portrait: right edge, vertically centered.
-              // Landscape: top (or bottom) edge, horizontally centered.
+              // ---------- Placement (saved separately for portrait and landscape) ----------
 
               private fun measureScreen() {
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -440,15 +457,29 @@ jobs:
                   }
               }
 
+              private fun isLandscape(): Boolean = screenWidth > screenHeight
+
+              private fun prefKey(): String = if (isLandscape()) "l" else "p"
+
+              // positions are stored as ratios (0..1) of the free space, per orientation
+              // default portrait: right edge, middle. default landscape: top edge, middle.
               private fun computeBubblePosition() {
-                  val landscape = screenWidth > screenHeight
-                  if (landscape) {
-                      params.x = ((screenWidth - bubbleSizePx) / 2).coerceAtLeast(0)
-                      params.y = if (LANDSCAPE_AT_TOP) 0 else (screenHeight - bubbleSizePx).coerceAtLeast(0)
-                  } else {
-                      params.x = (screenWidth - bubbleSizePx).coerceAtLeast(0)
-                      params.y = ((screenHeight - bubbleSizePx) / 2).coerceAtLeast(0)
-                  }
+                  val key = prefKey()
+                  val defX = if (isLandscape()) 0.5f else 1f
+                  val defY = if (isLandscape()) 0f else 0.5f
+                  val rx = prefs.getFloat(key + "_rx", defX).coerceIn(0f, 1f)
+                  val ry = prefs.getFloat(key + "_ry", defY).coerceIn(0f, 1f)
+                  params.x = (rx * maxOf(0, screenWidth - bubbleSizePx)).toInt()
+                  params.y = (ry * maxOf(0, screenHeight - bubbleSizePx)).toInt()
+              }
+
+              private fun savePosition() {
+                  val rx = params.x.toFloat() / maxOf(1, screenWidth - bubbleSizePx)
+                  val ry = params.y.toFloat() / maxOf(1, screenHeight - bubbleSizePx)
+                  prefs.edit()
+                      .putFloat(prefKey() + "_rx", rx.coerceIn(0f, 1f))
+                      .putFloat(prefKey() + "_ry", ry.coerceIn(0f, 1f))
+                      .apply()
               }
 
               override fun onConfigurationChanged(newConfig: Configuration) {
@@ -468,7 +499,7 @@ jobs:
               }
 
               private fun checkKeyboardState() {
-                  if (!::windowManager.isInitialized || !::bubbleContainer.isInitialized) return
+                  if (!::windowManager.isInitialized || !::bubbleContainer.isInitialized || dragging) return
                   try {
                       val imeWindow = windows?.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
                       if (imeWindow != null) {
@@ -506,18 +537,40 @@ jobs:
                   }
               }
 
-              // ---------- Touch: tap = open menu ----------
+              // ---------- Touch: tap = open menu, drag = move (no hold needed) ----------
 
               private fun handleTouch(v: View, event: MotionEvent): Boolean {
                   when (event.action) {
                       MotionEvent.ACTION_DOWN -> {
+                          downRawX = event.rawX
+                          downRawY = event.rawY
+                          initialX = params.x
+                          initialY = params.y
+                          dragging = false
                           applyTouchedAppearance()
                           return true
                       }
-                      MotionEvent.ACTION_MOVE -> return true
+                      MotionEvent.ACTION_MOVE -> {
+                          val dx = event.rawX - downRawX
+                          val dy = event.rawY - downRawY
+
+                          if (!dragging && (abs(dx) > dragSlopPx || abs(dy) > dragSlopPx)) {
+                              dragging = true
+                          }
+
+                          if (dragging) {
+                              params.x = (initialX + dx.toInt()).coerceIn(0, maxOf(0, screenWidth - bubbleSizePx))
+                              params.y = (initialY + dy.toInt()).coerceIn(0, maxOf(0, screenHeight - bubbleSizePx))
+                              windowManager.updateViewLayout(bubbleContainer, params)
+                          }
+                          return true
+                      }
                       MotionEvent.ACTION_UP -> {
                           applyIdleAppearance()
-                          if (event.x >= 0f && event.x <= v.width && event.y >= 0f && event.y <= v.height) {
+                          if (dragging) {
+                              dragging = false
+                              finishDrag()
+                          } else if (event.x >= 0f && event.x <= v.width && event.y >= 0f && event.y <= v.height) {
                               vibrate()
                               showMenu()
                           }
@@ -525,10 +578,61 @@ jobs:
                       }
                       MotionEvent.ACTION_CANCEL -> {
                           applyIdleAppearance()
+                          if (dragging) {
+                              dragging = false
+                              finishDrag()
+                          }
                           return true
                       }
                   }
                   return false
+              }
+
+              // after a drag: snap to the nearest edge for the current orientation, then save
+              private fun finishDrag() {
+                  var targetX = params.x
+                  var targetY = params.y
+
+                  if (SNAP_TO_EDGE) {
+                      if (isLandscape()) {
+                          // landscape: top or bottom edge
+                          val centerY = params.y + bubbleSizePx / 2
+                          targetY = if (centerY < screenHeight / 2) 0 else maxOf(0, screenHeight - bubbleSizePx)
+                      } else {
+                          // portrait: left or right edge
+                          val centerX = params.x + bubbleSizePx / 2
+                          targetX = if (centerX < screenWidth / 2) 0 else maxOf(0, screenWidth - bubbleSizePx)
+                      }
+                  }
+
+                  animateTo(targetX, targetY)
+              }
+
+              private fun animateTo(targetX: Int, targetY: Int) {
+                  val startX = params.x
+                  val startY = params.y
+                  val steps = 8
+                  var step = 0
+
+                  val animator = object : Runnable {
+                      override fun run() {
+                          step++
+                          val progress = step.toFloat() / steps
+                          params.x = (startX + (targetX - startX) * progress).toInt()
+                          params.y = (startY + (targetY - startY) * progress).toInt()
+                          try { windowManager.updateViewLayout(bubbleContainer, params) } catch (e: Exception) {}
+                          if (step < steps) {
+                              handler.postDelayed(this, 8L)
+                          } else {
+                              params.x = targetX
+                              params.y = targetY
+                              try { windowManager.updateViewLayout(bubbleContainer, params) } catch (e: Exception) {}
+                              if (keyboardVisible) preKeyboardY = params.y
+                              savePosition()
+                          }
+                      }
+                  }
+                  handler.post(animator)
               }
 
               // ---------- Menu (2-column grid) ----------
@@ -1027,7 +1131,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">Greytouch</string>
-              <string name="accessibility_service_description">Enables the Greytouch floating bubble. Tap it to open the quick menu.</string>
+              <string name="accessibility_service_description">Enables the Greytouch floating bubble. Tap it to open the quick menu, drag it to move it.</string>
           </resources>
           EOF
 
